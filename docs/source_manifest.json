@@ -1,0 +1,176 @@
+{
+  "sources": {
+    "3dfa_se3-master.zip": "61eafac521a64098e6104d97c60202e5d7b97a130a1bc659186c13805359714e",
+    "ndf_robot-master (1).zip": "6e583b337eea20b6fc68c04e5691d13a0595981729edc5a52c5f966e3b07dc19"
+  },
+  "changes": [
+    {
+      "path": "NDF_SETUP_GUIDE.md",
+      "status": "added",
+      "original_sha256": null,
+      "sha256": "bf9ccb04f565834746bd595ae2924a644236332bbb57a1df193132fb0f4a2967"
+    },
+    {
+      "path": "configs/ndf.json",
+      "status": "added",
+      "original_sha256": null,
+      "sha256": "92addafa4a4be5f0e9886058ea7b9f28e9e1edc16947cce03fcbb3d8cb6d768f"
+    },
+    {
+      "path": "docs/CHANGES.md",
+      "status": "added",
+      "original_sha256": null,
+      "sha256": "fd16f499a17a974157d4a5483a2b5774693e8379273d8e664f1e5fcff1ebf58c"
+    },
+    {
+      "path": "docs/VALIDATION.md",
+      "status": "added",
+      "original_sha256": null,
+      "sha256": "061ef503872553e9995ad6f92ac021afc3a20931b31c0f612764abfe0a2151b2"
+    },
+    {
+      "path": "environment-ndf.yml",
+      "status": "added",
+      "original_sha256": null,
+      "sha256": "a9679c8e90c5741509c50e640df9f820e20d5150106ae15bdd6045354b520052"
+    },
+    {
+      "path": "main.py",
+      "status": "modified",
+      "original_sha256": "392267b9433bc5ded0cb4bbb9cdec462c71ac7051a52e3e32ea329a6abc9816f",
+      "sha256": "e5095b685653af1c24655287ac88b5652ca9683a3efe057878b9ce087cd59645"
+    },
+    {
+      "path": "modeling/encoder/multimodal/encoder3d.py",
+      "status": "modified",
+      "original_sha256": "3b3e134b66fc7db90c1d46b683ef7e45a92cd803a49e6f852fe3e051d0c157cc",
+      "sha256": "d8423a45c90d20b2960fbab4bb626bad60900028cf597b39269328d0a18f82cf"
+    },
+    {
+      "path": "modeling/ndf/__init__.py",
+      "status": "added",
+      "original_sha256": null,
+      "sha256": "d28909e99c409089feba3de743928238eb1689e288f5494662d172436f8dd4cb"
+    },
+    {
+      "path": "modeling/ndf/config.py",
+      "status": "added",
+      "original_sha256": null,
+      "sha256": "f4c55b5c257e0b5b7f0e1ded2c564b4e7eb74f4f4b9b82e0b1541891844bdc36"
+    },
+    {
+      "path": "modeling/ndf/fusion.py",
+      "status": "added",
+      "original_sha256": null,
+      "sha256": "b1c24491344acf15c4fdb993a0a5f320b026c4a1f8751f80fa0d451336c254d9"
+    },
+    {
+      "path": "modeling/ndf/vendor/LICENSE.md",
+      "status": "added",
+      "original_sha256": null,
+      "sha256": "a1d68b93e821b73ec0728bad55da0218b7e651474c3301dd609ed1ad74fcc4e6"
+    },
+    {
+      "path": "modeling/ndf/vendor/PROVENANCE.md",
+      "status": "added",
+      "original_sha256": null,
+      "sha256": "e7421674fee1693d86476856395e9b1bbeed8d05cdb862be617aa29b9eb41036"
+    },
+    {
+      "path": "modeling/ndf/vendor/__init__.py",
+      "status": "added",
+      "original_sha256": null,
+      "sha256": "8cbd3f2a26e539563c97e87b1cbbb8adb8f8bc3701fa9720bf71c73336b18f8f"
+    },
+    {
+      "path": "modeling/ndf/vendor/layers_equi.py",
+      "status": "added",
+      "original_sha256": null,
+      "sha256": "f1333c4b22c3d0ebabd948c6be2a077956ea80fbe46c5628fa1ffd8e29a6b264"
+    },
+    {
+      "path": "modeling/ndf/vendor/network.py",
+      "status": "added",
+      "original_sha256": null,
+      "sha256": "34359a34b8ad0a4f9f0bdc8a7c610cc772d447c4c541ebe716cb002c305a107e"
+    },
+    {
+      "path": "modeling/policy/denoise_actor_3d.py",
+      "status": "modified",
+      "original_sha256": "b2b1ee87ff313aea5b81e42568f18b2626e68c7144878f878ea0a0e181404558",
+      "sha256": "1ff80c4c0e5447274a4d5de74f7deae98008a76e91f693da85f2cb55ec7fffce"
+    },
+    {
+      "path": "online_evaluation_rlbench/evaluate_policy.py",
+      "status": "modified",
+      "original_sha256": "72d81932df6783806b45ece54fec894d11c0f6fabec9ba98729581815a4a2e60",
+      "sha256": "a6af29da440afd5cb7677f95feec8931f70b72b92bb77acca6924c4bb5175377"
+    },
+    {
+      "path": "requirements-ndf.txt",
+      "status": "added",
+      "original_sha256": null,
+      "sha256": "6ae3f569d1d2da36b85881beec4ce957de1632d3733c75ce4d782ed0e90166b7"
+    },
+    {
+      "path": "scripts/rlbench/download_ndf_weights.sh",
+      "status": "added",
+      "original_sha256": null,
+      "sha256": "f5e30d99939deeb442ebac653ec6e8c6a1710c8082fc3515dab82ddd7c21baf9"
+    },
+    {
+      "path": "scripts/rlbench/train_peract_ndf.sh",
+      "status": "added",
+      "original_sha256": null,
+      "sha256": "f59bca0ac592f166e0b9d52cc7feb2067df930f8f5708d6f706a4d11d04ddfc1"
+    },
+    {
+      "path": "tests/test_configuration.py",
+      "status": "added",
+      "original_sha256": null,
+      "sha256": "a117a04008a4a300fe48c6fd24993779626a02560182f230ed415bf3624d3d16"
+    },
+    {
+      "path": "tests/test_frozen_fusion.py",
+      "status": "added",
+      "original_sha256": null,
+      "sha256": "bc2ead3daab6fbb8c35ade60605fd65601ccf0806be36a85f1979612298bb40d"
+    },
+    {
+      "path": "tests/test_training_arguments.py",
+      "status": "added",
+      "original_sha256": null,
+      "sha256": "410b384ff432e149b53431a1b45f80c97d3a15b368a6ca0e63e595cfd43af0d3"
+    },
+    {
+      "path": "tools/__init__.py",
+      "status": "added",
+      "original_sha256": null,
+      "sha256": "fbc3f28b59612ec9c9ff9ed8447476718b84da2aa93678b59dd4a721e099a48b"
+    },
+    {
+      "path": "tools/check_data.py",
+      "status": "added",
+      "original_sha256": null,
+      "sha256": "915d6c568eb5c0b5c67070cced9a86ce6da03407e9951217264f99868edd55a8"
+    },
+    {
+      "path": "tools/check_ndf.py",
+      "status": "added",
+      "original_sha256": null,
+      "sha256": "6b07cc312398c9244d123851e1e2fc782d1385aaf8111a0c549becf3e148e982"
+    },
+    {
+      "path": "tools/smoke_train.py",
+      "status": "added",
+      "original_sha256": null,
+      "sha256": "bbdd7870852919039c17ef58c03787ac410f4c2b50e808f3218bdfe7e5c5d063"
+    },
+    {
+      "path": "utils/trainers/base.py",
+      "status": "modified",
+      "original_sha256": "302f4550216f5ee227ed664ccd7241927ed7d22bf905ce99cc807285d6ed0ee9",
+      "sha256": "345e24bbca0c4215489b80dfdd3250614fa1b1cd8d860e766eabb74b0e0af963"
+    }
+  ]
+}

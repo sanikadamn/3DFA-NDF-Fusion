@@ -1,0 +1,2631 @@
+--- /dev/null
++++ b/NDF_SETUP_GUIDE.md
+@@ -0,0 +1,418 @@
++# Frozen NDF descriptors + 3DFA: AWS Linux setup and training
++
++This implementation is based on **your latest `3dfa_se3-master.zip`**, not the earlier drawer package. It adds frozen pretrained Neural Descriptor Field features to the observation encoder. The first experiment is the single-arm PerAct **`push_buttons`** task. The same code can train other supported PerAct tasks by selecting different demonstration data.
++
++**Delivery status:** the source modifications and executable training/check scripts are included. Local Python/shell checks and launcher/configuration tests passed. PyTorch is unavailable in the development environment and its installation was blocked; tensor tests, pretrained weight loading, dependency resolution, GPU training and simulator evaluation have not been verified here. Run the included real-batch smoke check before a long AWS run. No pretrained weights or demonstration datasets are bundled.
++
++## 1. What changes, and what remains the same
++
++For each spatial visual token, compute an NDF descriptor at that token's existing 3D location. Concatenate the two features and project back to the original transformer width:
++
++```python
++# visual_features: (B, N, 120)
++# ndf_descriptors: (B, N, 2049), frozen, queried at corresponding token XYZ
++combined = torch.cat([visual_features, ndf_descriptors], dim=-1)  # (B, N, 2169)
++fused_features = fusion(combined)                              # (B, N, 120)
++# fusion = nn.Linear(2169, 120)
++```
++
++**The encoder's new fusion layer accepts the larger dimension. The transformer still uses 120 dimensions and 8 attention heads.** Do not change RGB input channels from 3 to 2169, change XYZ coordinates, or set the entire transformer's embedding dimension to 2169.
++
++This is feature concatenation at corresponding spatial locations. Unlike the earlier extra-token implementation in this conversation, it does not append more scene tokens. It keeps the original sequence length and positional coordinates. The updated visual features feed the existing proprioception context, density sampling, and action-transformer attention. Sampling choices can change because the features change, although the sampler algorithm is unchanged.
++
++The network flow is:
++
++1. Original RGB/CLIP/FPN and vision-language attention produce visual features.
++2. Original point-cloud resizing establishes the XYZ corresponding to each token.
++3. The frozen NDF network encodes sampled observed geometry and describes those XYZ queries.
++4. A trainable concatenation/projection layer produces the original-width features.
++5. Original 3DFA predicts actions with its original loss, optimizer settings and flow-matching procedure.
++
++NDF encoding and feature fusion occur once per observation forward pass, before the denoising loop. They are reused across all five denoising steps in that pass. No target action, task success label, or simulator ground-truth object pose is used to construct the descriptors.
++
++### Exact baseline settings
++
++The reference is `scripts/rlbench/train_peract.sh` in your uploaded ZIP, not a paper configuration or the generic defaults in `main.py`.
++
++| Setting | Uploaded baseline and new launcher |
++|---|---|
++| Dataset/cameras | `PeractTwoCam`: wrist and front |
++| Arms | 1 (`bimanual=false`) |
++| Batch size / validation batch | 16 / 16 per GPU |
++| GPUs by default | 1 |
++| Training iterations | 300000 |
++| Validation interval | 4000 iterations |
++| Data workers / cache / chunk | 1 / 0.5 GB per worker / 1 |
++| Learning rate / scheduler | 1e-4 / constant |
++| Backbone learning rate | 1e-6; backbone remains frozen |
++| Weight decay | 1e-10 |
++| AdamW betas | (0.9, 0.95), inherited from trainer |
++| Gradient clipping | 10.0, inherited from trainer |
++| Embedding / attention heads | 120 / 8 |
++| Vision-language / shared attention layers | 2 / 4 |
++| Proprioception history | 3 |
++| Scene subsampling factor | 4 |
++| Actions | absolute, quaternion XYZW, keyposes |
++| Workspace-bound buffer | 0.04 |
++| Flow model / denoising steps | rectified_flow / 5 |
++| Compile / EMA / lv2 batch size | false / false / 1 |
++| Training precision | original BF16 autocast and GradScaler |
++| Image augmentation, losses, normalizer | original implementations |
++
++The fusion layer is new trainable model capacity. Its learning rate and optimizer treatment use the original optimizer automatically. NDF computations use float32 with autocast disabled and no gradients; the existing policy computation retains the baseline's precision settings. Runtime and memory consumption will increase, so identical hyperparameters do not imply identical training speed.
++
++## 2. Identify your AWS hardware
++
++Run these commands **on your AWS Linux instance**, after connecting by SSH:
++
++```bash
++uname -m
++cat /etc/os-release
++nvidia-smi
++free -h
++df -h .
++```
++
++`xlarge` is a size, not a GPU model. For example, AWS lists NVIDIA T4 for `g4dn` and NVIDIA A10G for `g5`. This guide's installer commands assume **x86_64 Linux**, such as g4dn/g5, rather than ARM-based g5g. Record the full EC2 instance type, GPU name and driver version with your experiment.
++
++Use an instance image with a working NVIDIA driver. If `nvidia-smi` fails, resolve the driver/image configuration first; a Python CUDA package does not install the system driver. Use a persistent mounted disk for demonstrations and checkpoints. The supplied data downloader fetches the full packaged archive even when you train only one task.
++
++The uploaded trainer uses BF16 autocast. Do not silently change it to FP16 while claiming an exact baseline match. A T4 may need different precision support than an A10G; the real-batch smoke check is the practical test. If your instance cannot execute the baseline precision or fit batch 16 with NDF, either use suitable hardware or explicitly document a revised configuration and apply the same revision to the baseline comparison.
++
++## 3. Install Miniconda and unpack the code
++
++Skip Miniconda installation if `conda --version` already works. On x86_64 Linux:
++
++```bash
++mkdir -p "$HOME/installers"
++curl -fL https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh \
++  -o "$HOME/installers/miniconda.sh"
++bash "$HOME/installers/miniconda.sh" -b -p "$HOME/miniconda3"
++source "$HOME/miniconda3/etc/profile.d/conda.sh"
++conda --version
++```
++
++Do not install over an existing `$HOME/miniconda3`; source that installation instead. In each new SSH session, source its `etc/profile.d/conda.sh` before activating the environment. Read and handle any channel terms prompt from conda according to your account/institution's policy.
++
++Upload the delivered ZIP to the instance, then:
++
++```bash
++unzip 3dfa_ndf_fusion.zip
++cd 3dfa_ndf_fusion
++conda env create -f environment-ndf.yml
++conda activate 3dfa-ndf
++python --version
++```
++
++The environment file creates Python 3.10 plus pip/setuptools/wheel. Everything below is run from this repository root. If you want to apply the changes to your own pristine checkout instead, see section 11.
++
++## 4. Install training dependencies
++
++For a compatible x86_64 NVIDIA machine, this is a concrete versioned starting environment:
++
++```bash
++python -m pip install --upgrade pip
++python -m pip install torch==2.5.1 torchvision==0.20.1 \
++  --index-url https://download.pytorch.org/whl/cu121
++python -m pip install -r requirements-ndf.txt
++python -m pip install 'git+https://github.com/openai/CLIP.git'
++python -m pip install -e .
++python -m pip check
++```
++
++PyTorch publishes the 2.5.1 / torchvision 0.20.1 CUDA 12.1 pair. These versions are a compatibility recipe for this source, **not** a claim that the uploaded author environment used these exact packages or that this complete environment was tested here. The requirements file pins top-level packages; transitive dependencies and the CLIP Git revision are not a complete lockfile. New GPU architectures may need a newer matching PyTorch/torchvision build.
++
++Why these dependencies matter:
++
++- PyTorch/torchvision: policy, NDF and image backbone operations.
++- OpenAI CLIP: original RN50 visual backbone. An unrelated PyPI package named `clip` will not work.
++- transformers: original CLIP tokenizer/text encoder.
++- Zarr **2**, numcodecs and blosc: original stored demonstration format. The source uses `DirectoryStore`/`LRUStoreCache`, so do not substitute Zarr 3.
++- kornia: original augmentation; diffusers: noise-scheduler imports; einops: tensor layouts.
++- SciPy, tqdm and tensorboard: baseline utilities and logs.
++
++The two required official NDF model files are vendored with their MIT license. **Do not install all of `ndf_robot/requirements.txt`** into this environment: its robot simulation stack is unnecessary for frozen descriptor extraction and can introduce unrelated dependency constraints.
++
++Check CUDA and model dependencies:
++
++```bash
++python - <<'PY'
++import torch, torchvision, clip, transformers, zarr
++assert torch.cuda.is_available(), 'CUDA unavailable'
++print('torch:', torch.__version__, 'torchvision:', torchvision.__version__)
++print('GPU:', torch.cuda.get_device_name(0))
++print('CUDA wheel runtime:', torch.version.cuda)
++print('Reported BF16 support:', torch.cuda.is_bf16_supported())
++print('Zarr:', zarr.__version__)
++assert hasattr(clip, 'load'), 'Install OpenAI CLIP, not an unrelated clip package'
++PY
++```
++
++First policy construction downloads/caches the baseline CLIP RN50 visual model and `openai/clip-vit-base-patch32` text model/tokenizer. Allow outbound access or prepopulate those caches on your AWS machine.
++
++## 5. Download the pretrained NDF weights
++
++```bash
++bash scripts/rlbench/download_ndf_weights.sh
++ls -lh checkpoints/multi_category_weights.pth
++```
++
++The script uses the official URL from your uploaded NDF repository and leaves an existing weight file unchanged. If the link expires, obtain the official weights separately and update `configs/ndf.json`:
++
++```json
++{
++  "checkpoint": "../checkpoints/multi_category_weights.pth",
++  "latent_dim": 256,
++  "num_points": 512,
++  "query_chunk_size": 256,
++  "scaling": 10.0
++}
++```
++
++Checkpoint paths are resolved relative to the JSON file. The released model is loaded strictly. A missing/incompatible file raises an error; production training does not silently use random NDF weights.
++
++These settings are NDF-specific additions, not changes to the original policy hyperparameters. `num_points` bounds the NDF cloud input. `query_chunk_size` bounds decoder workspace; all visual-token queries are still described. The official scaling multiplies centered cloud/query coordinates by 10 internally; do not multiply them by 10 a second time.
++
++Run:
++
++```bash
++python -m tools.check_ndf --device cuda
++python -m unittest discover -s tests -v
++```
++
++The standalone check loads your actual pretrained file, checks descriptor dimensions and rigid-transform consistency on synthetic geometry, and verifies that the fusion receives gradients while NDF remains frozen. Unit tests use small random networks to test architecture; their success alone is not pretrained-weight validation.
++
++## 6. Obtain and prepare push_buttons data
++
++The standard task in this uploaded PerAct code is **`push_buttons`**, canonical task ID **8**. This is not the separate single-button RLBench task called `push_button`. The PerAct task can include variations involving button sequences; using all its demonstrations is not the same as constructing a one-button-only benchmark. We retain the standard PerAct task here.
++
++If you have not downloaded the upstream data yet:
++
++```bash
++bash scripts/rlbench/peract_datagen.sh push_buttons
++```
++
++This existing script downloads packaged demonstrations and clean test seeds, and creates `zarr_datasets/peract/{train,val}.zarr`. It is unchanged. It skips downloading directories that already exist; the converter skips Zarr outputs that already exist, so an existing output can contain earlier tasks.
++
++For a task-specific dataset with an unambiguous path, convert the downloaded `.dat` files with the original converter:
++
++```bash
++mkdir -p zarr_datasets/peract_push_buttons
++python -m data_processing.peract_to_zarr \
++  --root peract_raw/Peract_packaged/ \
++  --tgt zarr_datasets/peract_push_buttons/ \
++  --tasks push_buttons
++
++python -m tools.check_data \
++  --dataset-dir zarr_datasets/peract_push_buttons \
++  --tasks push_buttons
++```
++
++The trailing slash on `--root` is required by the original converter's string concatenation. Only load trusted `.dat` demonstrations: the original converter uses pickle. Keep canonical task IDs; the supplied converter already preserves them for subsets. Do not renumber the selected task to zero.
++
++Expected training data:
++
++| Array | Shape / meaning |
++|---|---|
++| `rgb` | `(N,4,3,256,256)`, uint8 |
++| `pcd` | `(N,4,3,256,256)`, world XYZ in metres |
++| `proprioception` | `(N,3,1,8)` |
++| `action` | `(N,1,1,8)` |
++| `task_id`, `variation` | `(N,)` |
++
++Camera storage order is left shoulder, right shoulder, wrist, front; the original `PeractTwoCam` dataset selects the final two. Pose values are XYZ, quaternion XYZW, gripper state. Instruction strings come from `instructions/peract/instructions.json`.
++
++If you only have raw RLBench images and pickles, they are **not** direct inputs to this `.dat` converter. Use the provided prepackaged dataset workflow or supply an additional raw-to-packaged conversion step. Keep train/validation/test episodes separate; this change does not generate new splits or labels.
++
++## 7. Run one real training step before the full experiment
++
++```bash
++CUDA_VISIBLE_DEVICES=0 TASK=push_buttons SMOKE_ONLY=1 \
++  bash scripts/rlbench/train_peract_ndf.sh
++```
++
++This uses the actual dataset, baseline preprocessor/augmentation, original optimizer settings, batch 16, and the real policy. It:
++
++1. Loads pretrained NDF and the baseline CLIP assets.
++2. Computes training action bounds as the baseline does.
++3. Runs one forward/backward/optimizer step.
++4. Checks that every NDF state tensor (including buffers) stayed unchanged.
++5. Checks that NDF parameters are excluded from the optimizer and the fusion weights updated.
++6. Runs inference and checks for finite single-arm 8D actions.
++
++The diagnostic does not resume or overwrite policy checkpoints; its logs use the experiment's `smoke` subdirectory. Passing it is required before treating the implementation as runtime-validated on your machine. A CUDA out-of-memory error here means the complete batch-16 configuration has not fit that GPU; a baseline fitting does not guarantee the augmented model fits.
++
++NDF is processed one observation at a time and queries are chunked to limit temporary memory. These loops do **not** change the policy training batch, gradient accumulation, number of action samples or number of spatial tokens. Changing query chunk size is a workspace tradeoff; changing the policy batch is a training change.
++
++## 8. Train with the uploaded baseline parameters
++
++```bash
++CUDA_VISIBLE_DEVICES=0 TASK=push_buttons \
++  bash scripts/rlbench/train_peract_ndf.sh
++```
++
++The new launcher is derived from your uploaded `train_peract.sh`. An automated test records both launchers' actual arguments and confirms that all training settings match, except dataset/output paths and the new NDF config argument. The original launcher is still present and unchanged.
++
++Default checkpoints are under:
++
++```text
++train_logs/Peract_push_buttons_ndf/
++  denoise3d-PeractTwoCam-C120-B16-lr1e-4-constant-H3-rectified_flow/
++    run_config.json
++    best.pth
++    last.pth
++```
++
++The first checkpoint is saved after validation at step 4000, as in the baseline. A very short `TRAIN_ITERS=20` run would not produce a checkpoint; use the dedicated smoke command for debugging. The default 300000-step run ends at a validation boundary. `best.pth` uses the original validation positional-accuracy metric, not online task success.
++
++The launcher automatically resumes `last.pth` in the selected experiment directory. Keep the same task data and NDF numerical config on resume. The fusion model cannot resume a baseline checkpoint as though it were the same architecture; use a fresh experiment directory. NDF weights are included in saved policy checkpoints, so resume/evaluation can restore them even if the original NDF weight-file path has moved. The configuration JSON is still needed to construct a training run.
++
++`run_config.json` records resolved settings. Also save your environment and downloaded weight hash:
++
++```bash
++mkdir -p experiment_records
++conda env export > experiment_records/environment.yml
++python -m pip freeze > experiment_records/pip-freeze.txt
++sha256sum checkpoints/multi_category_weights.pth > experiment_records/ndf-weight-sha256.txt
++nvidia-smi > experiment_records/gpu.txt
++```
++
++You may use `tmux` to keep training alive after SSH disconnects. To monitor TensorBoard without opening a public service:
++
++```bash
++python -m tensorboard.main --logdir train_logs/Peract_push_buttons_ndf --host 127.0.0.1 --port 6006
++```
++
++From your local machine, establish an SSH tunnel with your normal EC2 username/key/hostname, for example `ssh -L 6006:localhost:6006 ubuntu@YOUR_EC2_HOST`; open `http://localhost:6006` locally. Supply your normal `-i` key option if needed.
++
++### Baseline comparison
++
++```bash
++CUDA_VISIBLE_DEVICES=0 TASK=push_buttons MODE=baseline \
++  bash scripts/rlbench/train_peract_ndf.sh
++```
++
++This omits NDF entirely and writes to `Peract_push_buttons_baseline`. Use the same data, training steps, hardware and precision. The uploaded trainer does not fully seed all RNGs; this delivery does not change that behavior. A single-run difference is not evidence of a reliable gain: run repeated experiments and record the initialization/reproducibility strategy if extending the baseline for controlled comparisons.
++
++### More GPUs
++
++On a single node with two visible GPUs:
++
++```bash
++CUDA_VISIBLE_DEVICES=0,1 NGPUS=2 TASK=push_buttons \
++  EXP_NAME=Peract_push_buttons_ndf_2gpu \
++  bash scripts/rlbench/train_peract_ndf.sh
++```
++
++This keeps 16 samples **per GPU** and changes the global batch from 16 to 32. It is therefore not an exact match to the uploaded one-GPU experiment. For your exact comparison, keep `NGPUS=1`. `NGPUS` is a single-node option; multi-node rendezvous is not configured here.
++
++## 9. Train another task without changing the model
++
++For example:
++
++```bash
++mkdir -p zarr_datasets/peract_open_drawer
++python -m data_processing.peract_to_zarr \
++  --root peract_raw/Peract_packaged/ \
++  --tgt zarr_datasets/peract_open_drawer/ \
++  --tasks open_drawer
++python -m tools.check_data --dataset-dir zarr_datasets/peract_open_drawer --tasks open_drawer
++CUDA_VISIBLE_DEVICES=0 TASK=open_drawer bash scripts/rlbench/train_peract_ndf.sh
++```
++
++The `TASK` environment variable chooses default dataset/output directory names; it does **not** filter a mixed Zarr store. Dataset selection is performed by the existing converter. Always run `check_data` to verify what you will train on.
++
++For a joint model, convert several supported task names into a fresh directory and point `DATASET_DIR` at it. All 18 canonical PerAct tasks in `datasets/rlbench.py` are supported by that converter. An arbitrary new RLBench task requires task mapping, instructions and matching data, not just an arbitrary `TASK` string. Changing to PerAct2 or another robot requires additional integration outside this single-arm experiment.
++
++## 10. Online evaluation after training (optional for setup)
++
++Offline training and Zarr conversion do not need RLBench, PyRep or CoppeliaSim. For closed-loop success evaluation, use the single-arm setup in the original `README.md`. A separate evaluation environment avoids disturbing your working training environment:
++
++```bash
++conda create -n 3dfa-ndf-eval --clone 3dfa-ndf
++conda activate 3dfa-ndf-eval
++python -m pip install open3d
++mkdir -p "$HOME/robotics"
++cd "$HOME/robotics"
++git clone https://github.com/stepjam/PyRep.git
++cd PyRep
++wget https://www.coppeliarobotics.com/files/V4_1_0/CoppeliaSim_Edu_V4_1_0_Ubuntu20_04.tar.xz
++tar -xf CoppeliaSim_Edu_V4_1_0_Ubuntu20_04.tar.xz
++export COPPELIASIM_ROOT="$PWD/CoppeliaSim_Edu_V4_1_0_Ubuntu20_04"
++export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:$COPPELIASIM_ROOT"
++export QT_QPA_PLATFORM_PLUGIN_PATH="$COPPELIASIM_ROOT"
++python -m pip install -r requirements.txt
++python -m pip install -e .
++cd ..
++git clone -b peract https://github.com/MohitShridhar/RLBench.git
++cd RLBench
++python -m pip install -r requirements.txt
++python -m pip install -e .
++```
++
++These simulator commands follow the uploaded README's Ubuntu20.04 binary setup; other Linux distributions can require additional Qt/OpenGL system libraries. Install Xvfb on an Ubuntu machine if absent (`sudo apt-get update` then `sudo apt-get install xvfb xauth`). Export the CoppeliaSim variables in every evaluation shell. The simulator setup has not been exercised here.
++
++Return to the delivered repository root and evaluate:
++
++```bash
++CHECKPOINT=/absolute/path/to/your/best.pth \
++CHECKPOINT_ALIAS=push_buttons_ndf \
++DATA_DIR=peract_raw/test \
++TASKS="push_buttons" \
++  bash online_evaluation_rlbench/eval_peract.sh
++```
++
++New checkpoints contain architecture/camera settings and frozen NDF weights. The patched evaluator restores them before selecting the environment cameras and loads new-format state dictionaries strictly. This prevents accidental evaluation with the four-camera CLI default when training used `PeractTwoCam`. The evaluation shell script itself remains unchanged; avoid spaces in its path environment variables because the original script does not quote all expansions.
++
++## 11. Exact source changes and how to apply them manually
++
++The supplied ZIP is already modified. Do **not** apply the patch again to it.
++
++For a pristine extraction of exactly your uploaded baseline:
++
++```bash
++cd /path/to/pristine/3dfa_se3-master
++# Keep the delivered patch outside this checkout.
++git apply --check /path/to/ndf_fusion.patch
++git apply /path/to/ndf_fusion.patch
++```
++
++The patch is in `docs/ndf_fusion.patch`; it contains all new source, configuration and guide files except itself and the generated source manifest. It does not delete files. You can also follow these edits directly:
++
++1. Add `modeling/ndf/fusion.py`, `config.py` and the two official vendor model files. The full implementation is supplied, not pseudocode.
++2. In `modeling/encoder/multimodal/encoder3d.py`, accept `ndf_config`/`ndf_load_pretrained`, construct `self.ndf_fusion`, retain `source_pcd` before resizing, and fuse immediately after computing aligned token XYZ in `encode_clip`. The base encoder then consumes the fused features automatically.
++3. In `modeling/policy/denoise_actor_3d.py`, pass those optional settings to `Encoder`. No decoder or output-head dimensions change.
++4. In `main.py`, add the optional `--ndf_config` JSON path. Omitting it leaves the baseline model architecture intact.
++5. In `utils/trainers/base.py`, parse/validate the NDF config, pass it into model construction, record configs in checkpoints, and check compatibility at resume. The existing optimizer already skips `requires_grad=False` parameters, so its grouping logic is unchanged. A small `checkpoint is None` guard also permits the standalone smoke check.
++6. In `online_evaluation_rlbench/evaluate_policy.py`, reconstruct architecture and NDF from checkpoint metadata, strip only a real DDP `module.` prefix, and select cameras after loading the metadata.
++7. Use the added `scripts/rlbench/train_peract_ndf.sh` rather than modifying the original baseline launcher.
++
++Frozen means all three of these are implemented:
++
++```python
++self.field.requires_grad_(False)  # no trainable NDF parameters
++self.field.eval()                # no updating batch-normalization statistics
++# Descriptor extraction runs inside torch.no_grad().
++# The fusion Linear layer is OUTSIDE that block and remains trainable.
++```
++
++The custom `train()` override puts the field back in eval mode whenever the parent policy is switched to training. Frozen weights alone would not protect running buffers. `fusion.weight` is initialized to `[I, 0]` and its bias to zero, so the added layer starts by passing through the original visual features; its descriptor columns receive gradients from the first training step and can learn to use NDF features.
++
++## 12. Interpretation and limitations
++
++- The original NDF network uses a Vector Neuron encoder and an occupancy decoder. The `acts='all'` descriptor has dimension `(2*256+1) + 6*256 = 2049`; it is not the 256-dimensional latent code itself.
++- One common sampled-cloud centroid is subtracted from both NDF input points and query points. The original world-space XYZ for 3DFA positional encoding is unchanged.
++- The default conditions on the observed scene cloud. The packaged dataset has no object segmentation masks; this is not an object-segmented NDF reproduction. Sampling uses fixed pixel-order indices, which are consistent under a coordinate relabeling but not arbitrary point permutation or re-rendering.
++- The released multi-category checkpoint was trained on mug, bowl and bottle geometry. Button scenes are out of that training domain. This is a transfer experiment; pretrained descriptors are not guaranteed to help buttons.
++- Frozen NDF plus an unconstrained policy does not guarantee end-to-end SE(3) equivariance. Success rate and transformation consistency are empirical questions.
++- Pretrained weights, data downloads, GPU memory and full training remain to be validated on your AWS instance. Tests and scripts expose these checks; no training results are claimed in this delivery.
++
++## References and source of setup choices
++
++- Uploaded baseline `3dfa_se3-master.zip`: authoritative source for the training settings and data/evaluation commands; archive hashes in `docs/source_manifest.json`.
++- Uploaded `ndf_robot-master (1).zip`: authoritative source for the vendored model and weight-download URL.
++- Miniconda Linux installation: https://www.anaconda.com/docs/getting-started/miniconda/install/linux-install
++- Published PyTorch/torchvision version pairs: https://pytorch.org/get-started/previous-versions/
++- OpenAI CLIP installation: https://github.com/openai/CLIP
++- AWS instance hardware: https://docs.aws.amazon.com/ec2/latest/instancetypes/ac.html
++- PerAct benchmark/tasks: https://github.com/peract/peract
+--- /dev/null
++++ b/configs/ndf.json
+@@ -0,0 +1,7 @@
++{
++  "checkpoint": "../checkpoints/multi_category_weights.pth",
++  "latent_dim": 256,
++  "num_points": 512,
++  "query_chunk_size": 256,
++  "scaling": 10.0
++}
+--- /dev/null
++++ b/docs/CHANGES.md
+@@ -0,0 +1,39 @@
++# Changes relative to the uploaded 3dfa_se3-master.zip
++
++## Modified original files
++
++| File | Change |
++|---|---|
++| `main.py` | Adds optional `--ndf_config`; all original argument defaults remain unchanged. |
++| `modeling/policy/denoise_actor_3d.py` | Threads optional NDF settings into the encoder. |
++| `modeling/encoder/multimodal/encoder3d.py` | Retains full observed cloud, queries frozen NDF at the existing token XYZ, and fuses concatenated descriptors/visual features back to embedding_dim. |
++| `utils/trainers/base.py` | Constructs optional NDF, saves run/configuration metadata, restores checkpoints with compatibility checks, and guards absent checkpoint paths. The training loop, optimizer, loss, precision, augmentation, loaders and normalizer math are unchanged. |
++| `online_evaluation_rlbench/evaluate_policy.py` | Restores architecture/camera/NDF settings from new checkpoints before environment selection; strips only an actual DDP prefix and strictly loads new checkpoints. |
++
++## Added files
++
++- `modeling/ndf/fusion.py`: actual official-model adapter; 2169-to-120 trainable feature fusion, identity visual initialization, frozen NDF eval/no_grad/optimizer exclusion, observation/query chunking.
++- `modeling/ndf/config.py`: validated configuration, metadata and resume checks.
++- `modeling/ndf/vendor/`: two supplied official NDF source files, package marker, original license and provenance. Only a relative import and four input-device allocations changed in vendored code.
++- `modeling/ndf/__init__.py`: package marker.
++- `configs/ndf.json`: weight path and NDF-only settings.
++- `scripts/rlbench/train_peract_ndf.sh`: original launcher parameters with additional NDF argument and configurable task directory/mode/GPU count. The original launcher remains untouched.
++- `scripts/rlbench/download_ndf_weights.sh`: downloads official pretrained weights to the configured location.
++- `tools/check_ndf.py`: real pretrained weights/dimensions/gradient/invariance check.
++- `tools/check_data.py`: task ID, array shape and instruction coverage check for task-specific Zarr stores.
++- `tools/smoke_train.py`: actual real-batch DDP training step, frozen-state assertions and inference; no policy checkpoint mutation.
++- `tools/__init__.py`: package marker.
++- `tests/`: configuration/resume tests, actual launcher comparison, tensor-level frozen-fusion tests.
++- `environment-ndf.yml`, `requirements-ndf.txt`: proposed versioned setup recipe (not a fully validated environment lock).
++- `NDF_SETUP_GUIDE.md`: detailed AWS Linux, Miniconda, code edits, data, training and evaluation instructions.
++- `docs/CHANGES.md`, `docs/VALIDATION.md`, `docs/source_manifest.json`, `docs/ndf_fusion.patch`: review/provenance artifacts.
++
++No original files are deleted. Data conversion and dataset classes are unchanged:
++this uploaded baseline already supports selecting arbitrary canonical PerAct task
++subsets at conversion time. The task name controls paths in the new launcher, not
++sample filtering. The new learned fusion can change density-sampler selections
++through changed features; the sampler algorithm itself is unchanged.
++
++This version uses per-token **feature concatenation** rather than appending extra
++NDF tokens. It implements the user's current request for a larger encoder input
++while preserving the transformer dimension and baseline training hyperparameters.
+--- /dev/null
++++ b/docs/VALIDATION.md
+@@ -0,0 +1,34 @@
++# Validation record
++
++Executed in the development environment:
++
++- Python compileall: passed for all delivered Python source.
++- bash -n: passed for the two added shell scripts.
++- unittest: 14 tests discovered; 7 passed, 7 skipped because PyTorch is unavailable.
++- The launcher test executes original/new shell scripts with a recording torchrun
++  and parses their actual arguments with the actual main.py argument function.
++  Only dataset/output paths and the NDF config differ at default settings.
++- Vendor-source comparison: only the documented relative import and four device
++  allocations differ from the supplied NDF sources.
++- The generated unified patch applies to a pristine copy of the supplied baseline;
++  all resulting files are byte-compared with the delivered tree (excluding the
++  patch/manifest themselves).
++
++Not executed here:
++
++- Miniconda creation or complete dependency installation/resolution.
++- PyTorch tensor tests (installation was attempted but the CPU wheel was unavailable
++  through the execution environment's network).
++- Actual pretrained NDF checkpoint download/loading.
++- Real-batch smoke test, GPU training, memory/throughput benchmarks.
++- RLBench/CoppeliaSim installation or closed-loop task evaluation.
++
++Required next checks on AWS are documented in the guide:
++
++1. pip check and CUDA/import checks.
++2. tools.check_ndf using real pretrained weights.
++3. unittest (ensure tensor tests run, not skip).
++4. tools.check_data for the chosen task data.
++5. SMOKE_ONLY=1 with the actual batch-16 training configuration.
++
++No performance, convergence, success-rate or policy-equivariance claims are made.
+--- /dev/null
++++ b/environment-ndf.yml
+@@ -0,0 +1,8 @@
++name: 3dfa-ndf
++channels:
++  - defaults
++dependencies:
++  - python=3.10
++  - pip
++  - setuptools<81
++  - wheel
+--- a/main.py
++++ b/main.py
+@@ -23,6 +23,7 @@
+         ('train_instructions', Path, ''),
+         ('val_instructions', Path, ''),
+         ('dataset', str, "Peract"),
++        ('ndf_config', str_none, None),
+         ('num_workers', int, 4),
+         ('batch_size', int, 64),
+         ('batch_size_val', int, 64),
+--- a/modeling/encoder/multimodal/encoder3d.py
++++ b/modeling/encoder/multimodal/encoder3d.py
+@@ -20,7 +20,9 @@
+                  num_vis_instr_attn_layers=2,
+                  fps_subsampling_factor=5,
+                  finetune_backbone=False,
+-                 finetune_text_encoder=False):
++                 finetune_text_encoder=False,
++                 ndf_config=None,
++                 ndf_load_pretrained=True):
+         super().__init__(
+             backbone=backbone,
+             embedding_dim=embedding_dim,
+@@ -55,6 +57,11 @@
+         # Camera IDs for the 2D cameras
+         self.camera_ids = nn.Embedding(2, embedding_dim)
+         self.pos_embed_2d = SinusoidalPosEmb(embedding_dim)
++
++        self.ndf_fusion = None
++        if ndf_config is not None:
++            from ...ndf.fusion import FrozenNDFFusion
++            self.ndf_fusion = FrozenNDFFusion(embedding_dim, ndf_config, ndf_load_pretrained)
+ 
+     def encode_proprio(self, proprio, context_feats, context_pos):
+         """
+@@ -101,6 +108,7 @@
+             - pcd: (B, Np, 3)
+             - instr_feats: (B, L, F)
+         """
++        source_pcd = pcd  # keep full observed geometry before visual-grid resizing
+         # Encode language
+         instruction = self.text_encoder(text)
+         instr_feats = self.instruction_encoder(instruction)
+@@ -136,6 +144,10 @@
+             "(bt ncam) c h w -> bt (ncam h w) c", ncam=num_cameras
+         )
+ 
++        # Increase the per-token feature width, then return to embedding_dim.
++        if self.ndf_fusion is not None:
++            rgb3d_feats = self.ndf_fusion(source_pcd, pcd, rgb3d_feats)
++
+         # 2D camera features (don't support mixed cameras in this release)
+         rgb2d_feats = None
+ 
+--- /dev/null
++++ b/modeling/ndf/__init__.py
+@@ -0,0 +1 @@
++"""Frozen Neural Descriptor Field feature fusion."""
+--- /dev/null
++++ b/modeling/ndf/config.py
+@@ -0,0 +1,55 @@
++from dataclasses import dataclass, asdict
++import json
++import math
++from pathlib import Path
++
++
++@dataclass(frozen=True)
++class NDFConfig:
++    checkpoint: str = ""
++    latent_dim: int = 256
++    num_points: int = 512
++    query_chunk_size: int = 256
++    scaling: float = 10.0
++
++    def __post_init__(self):
++        if self.latent_dim < 1 or self.num_points < 20 or self.query_chunk_size < 1:
++            raise ValueError("Require latent_dim >= 1, num_points >= 20, query_chunk_size >= 1")
++        if not math.isfinite(self.scaling) or self.scaling <= 0:
++            raise ValueError("NDF scaling must be finite and positive")
++
++    def to_dict(self):
++        return asdict(self)
++
++    @classmethod
++    def read(cls, filename):
++        path = Path(filename).resolve()
++        data = json.loads(path.read_text())
++        if data.get("checkpoint"):
++            weights = Path(data["checkpoint"]).expanduser()
++            data["checkpoint"] = str((path.parent / weights).resolve())
++        return cls(**data)
++
++
++MODEL_KEYS = (
++    "model_type", "backbone", "num_vis_instr_attn_layers", "fps_subsampling_factor",
++    "embedding_dim", "num_attn_heads", "num_history", "bimanual",
++    "num_shared_attn_layers", "relative_action", "rotation_format",
++    "denoise_timesteps", "denoise_model", "dataset",
++)
++
++
++def metadata(args):
++    return {"ndf_config": args.ndf_settings,
++            "model_config": {key: getattr(args, key) for key in MODEL_KEYS}}
++
++
++def check_resume(saved, args):
++    current = metadata(args)
++    # Prevent silent loss/addition of NDF and mismatched architecture on resume.
++    def numerical(config):
++        return None if config is None else {k: v for k, v in config.items() if k != "checkpoint"}
++    if numerical(saved.get("ndf_config")) != numerical(current["ndf_config"]):
++        raise ValueError("Resume NDF configuration mismatch; use a new experiment directory")
++    if "model_config" in saved and saved["model_config"] != current["model_config"]:
++        raise ValueError("Resume model/camera configuration mismatch")
+--- /dev/null
++++ b/modeling/ndf/fusion.py
+@@ -0,0 +1,95 @@
++"""Concatenate official frozen NDF descriptors with aligned 3DFA visual tokens."""
++from pathlib import Path
++
++import torch
++from torch import nn
++
++from .config import NDFConfig
++from .vendor.network import VNNOccNet
++
++
++class FrozenNDFFusion(nn.Module):
++    def __init__(self, visual_dim, config, load_pretrained=True):
++        super().__init__()
++        self.config = config if isinstance(config, NDFConfig) else NDFConfig(**config)
++        self.visual_dim = visual_dim
++        self.field = VNNOccNet(latent_dim=self.config.latent_dim, model_type="pointnet",
++                               return_features=True, acts="all", sigmoid=True,
++                               scaling=self.config.scaling)
++        if load_pretrained:
++            if not self.config.checkpoint or not Path(self.config.checkpoint).is_file():
++                raise FileNotFoundError("Set the NDF JSON checkpoint to pretrained NDF weights")
++            state = torch.load(self.config.checkpoint, map_location="cpu", weights_only=True)
++            if "state_dict" in state:
++                state = state["state_dict"]
++            elif "model_state_dict" in state:
++                state = state["model_state_dict"]
++            self.field.load_state_dict(state, strict=True)
++        self.field.requires_grad_(False)
++        self.field.eval()
++        # Official acts='all': (2*L+1) invariant inputs + six L-wide activations.
++        self.descriptor_dim = 8 * self.config.latent_dim + 1
++        self.fusion = nn.Linear(visual_dim + self.descriptor_dim, visual_dim)
++        # Starts as the original visual pathway; NDF weights can learn from step 1.
++        with torch.no_grad():
++            self.fusion.weight.zero_()
++            self.fusion.weight[:, :visual_dim].copy_(torch.eye(visual_dim))
++            self.fusion.bias.zero_()
++
++    def train(self, mode=True):
++        super().train(mode)
++        self.field.eval()  # freeze running statistics as well as weights
++        return self
++
++    @torch.no_grad()
++    def encode_cloud(self, cloud):
++        """One observation's (M,3) metric points; no actions/labels are consumed."""
++        with torch.autocast(device_type=cloud.device.type, enabled=False):
++            cloud = cloud.float()
++            cloud = cloud[torch.isfinite(cloud).all(-1)]
++            if len(cloud) < 20:
++                raise ValueError("NDF requires at least 20 finite observed points")
++            indices = torch.linspace(0, len(cloud)-1, self.config.num_points,
++                                     device=cloud.device).round().long()
++            points = cloud[indices].unsqueeze(0)
++            center = points.mean(1, keepdim=True)
++            latent = self.field.extract_latent({"point_cloud": points-center})
++        return latent, center
++
++    @torch.no_grad()
++    def describe(self, latent, center, queries):
++        with torch.autocast(device_type=queries.device.type, enabled=False):
++            if not torch.isfinite(queries).all():
++                raise ValueError("Nonfinite query XYZ in 3DFA scene tokens")
++            descriptors = self.field.forward_latent(latent, queries.float()-center)
++        if descriptors.shape[-1] != self.descriptor_dim or not torch.isfinite(descriptors).all():
++            raise ValueError("Unexpected NDF descriptor shape or nonfinite features")
++        return descriptors
++
++    def forward(self, scene_pcd, query_xyz, visual_features):
++        """(B,Cam,3,H,W), (B,N,3), (B,N,C) -> (B,N,C).
++
++        Query exactly where the original encoder places each visual token; do not
++        pool descriptors into one vector or change positional coordinates.
++        Chunking changes workspace memory, not the policy batch or token count.
++        """
++        if scene_pcd.ndim != 5 or scene_pcd.shape[2] != 3:
++            raise ValueError("Expected scene cloud (B,cameras,3,H,W)")
++        if query_xyz.shape[:2] != visual_features.shape[:2] or query_xyz.shape[-1] != 3:
++            raise ValueError("Queries must align one-to-one with visual tokens")
++        if scene_pcd.shape[0] != query_xyz.shape[0] or visual_features.shape[-1] != self.visual_dim:
++            raise ValueError("Batch or feature dimension mismatch")
++        cloud = scene_pcd.permute(0,1,3,4,2).reshape(scene_pcd.shape[0],-1,3)
++        batches = []
++        # NDF is evaluated one observation at a time to bound its kNN workspace.
++        for b in range(len(cloud)):
++            latent, center = self.encode_cloud(cloud[b])
++            chunks = []
++            for start in range(0, query_xyz.shape[1], self.config.query_chunk_size):
++                stop = start+self.config.query_chunk_size
++                descriptors = self.describe(latent, center, query_xyz[b:b+1,start:stop])
++                visual = visual_features[b:b+1,start:stop]
++                enlarged = torch.cat((visual, descriptors.to(visual.dtype)), dim=-1)
++                chunks.append(self.fusion(enlarged))  # OUTSIDE no_grad: train this layer
++            batches.append(torch.cat(chunks, dim=1))
++        return torch.cat(batches, dim=0)
+--- /dev/null
++++ b/modeling/ndf/vendor/LICENSE.md
+@@ -0,0 +1,21 @@
++MIT License
++
++Copyright (c) 2022 Anthony Simeonov and Yilun Du
++
++Permission is hereby granted, free of charge, to any person obtaining a copy
++of this software and associated documentation files (the "Software"), to deal
++in the Software without restriction, including without limitation the rights
++to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++copies of the Software, and to permit persons to whom the Software is
++furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in all
++copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++SOFTWARE.
+--- /dev/null
++++ b/modeling/ndf/vendor/PROVENANCE.md
+@@ -0,0 +1,17 @@
++# Source and license
++
++Copied from the supplied `ndf_robot-master (1).zip` (SHA-256 in docs/source_manifest.json):
++
++- `src/ndf_robot/model/vnn_occupancy_net_pointnet_dgcnn.py` -> `network.py`.
++- `src/ndf_robot/model/layers_equi.py` -> `layers_equi.py`.
++- `LICENSE.md` copied unchanged.
++
++Only two compatibility edits were made: the network's layer import is package-relative,
++and four `torch.device('cuda')` allocations use `x.device` for CPU/current-GPU support.
++No parameter names or neural-network computations were changed. The official
++PointNet-based Vector Neuron encoder and occupancy decoder are used with
++`latent_dim=256, return_features=True, acts='all', sigmoid=True, scaling=10`.
++
++Original repository: https://github.com/anthonysimeonov/ndf_robot
++MIT copyright: Anthony Simeonov and Yilun Du, 2022. See LICENSE.md.
++No upstream Git commit ID is asserted for the uploaded archive.
+--- /dev/null
++++ b/modeling/ndf/vendor/__init__.py
+@@ -0,0 +1 @@
++"""Official NDF network; see LICENSE.md and PROVENANCE.md."""
+--- /dev/null
++++ b/modeling/ndf/vendor/layers_equi.py
+@@ -0,0 +1,354 @@
++import os
++import sys
++import copy
++import math
++import numpy as np
++import torch
++import torch.nn as nn
++import torch.nn.functional as F
++
++EPS = 1e-6
++
++
++def knn(x, k):
++    inner = -2*torch.matmul(x.transpose(2, 1), x)
++    xx = torch.sum(x**2, dim=1, keepdim=True)
++    pairwise_distance = -xx - inner - xx.transpose(2, 1)
++ 
++    idx = pairwise_distance.topk(k=k, dim=-1)[1]   # (batch_size, num_points, k)
++    return idx
++
++
++def get_graph_feature(x, k=20, idx=None, x_coord=None):
++    batch_size = x.size(0)
++    num_points = x.size(3)
++    x = x.view(batch_size, -1, num_points)
++    if idx is None:
++        if x_coord is not None: # dynamic knn graph
++            idx = knn(x_coord, k=k)   # (batch_size, num_points, k)
++        else:             # fixed knn graph with input point coordinates
++            idx = knn(x, k=k)
++    device = x.device
++
++    idx_base = torch.arange(0, batch_size, device=device).view(-1, 1, 1)*num_points
++
++    idx = idx + idx_base
++
++    idx = idx.view(-1)
++ 
++    _, num_dims, _ = x.size()
++    num_dims = num_dims // 3
++
++    x = x.transpose(2, 1).contiguous()   # (batch_size, num_points, num_dims)  -> (batch_size*num_points, num_dims) #   batch_size * num_points * k + range(0, batch_size*num_points)
++    feature = x.view(batch_size*num_points, -1)[idx, :]
++    feature = feature.view(batch_size, num_points, k, num_dims, 3) 
++    x = x.view(batch_size, num_points, 1, num_dims, 3).repeat(1, 1, k, 1, 1)
++    
++    feature = torch.cat((feature-x, x), dim=3).permute(0, 3, 4, 1, 2).contiguous()
++  
++    return feature
++
++
++def get_graph_feature_cross(x, k=20, idx=None):
++    batch_size = x.size(0)
++    num_points = x.size(3)
++    x = x.view(batch_size, -1, num_points)
++    if idx is None:
++        idx = knn(x, k=k)   # (batch_size, num_points, k)
++    device = x.device
++
++    idx_base = torch.arange(0, batch_size, device=device).view(-1, 1, 1)*num_points
++
++    idx = idx + idx_base
++
++    idx = idx.view(-1)
++ 
++    _, num_dims, _ = x.size()
++    num_dims = num_dims // 3
++
++    x = x.transpose(2, 1).contiguous()   # (batch_size, num_points, num_dims)  -> (batch_size*num_points, num_dims) #   batch_size * num_points * k + range(0, batch_size*num_points)
++    feature = x.view(batch_size*num_points, -1)[idx, :]
++    feature = feature.view(batch_size, num_points, k, num_dims, 3) 
++    x = x.view(batch_size, num_points, 1, num_dims, 3).repeat(1, 1, k, 1, 1)
++    cross = torch.cross(feature, x, dim=-1)
++    
++    feature = torch.cat((feature-x, x, cross), dim=3).permute(0, 3, 4, 1, 2).contiguous()
++  
++    return feature
++
++
++def get_graph_mean(x, k=20, idx=None):
++    batch_size = x.size(0)
++    num_points = x.size(3)
++    x = x.reshape(batch_size, -1, num_points).contiguous()
++    if idx is None:
++        idx = knn(x, k=k)   # (batch_size, num_points, k)
++    device = x.device
++
++    idx_base = torch.arange(0, batch_size, device=device).view(-1, 1, 1)*num_points
++
++    idx = idx + idx_base
++
++    idx = idx.view(-1)
++ 
++    _, num_dims, _ = x.size()
++    num_dims = num_dims // 3
++
++    x = x.transpose(2, 1).contiguous()   # (batch_size, num_points, num_dims)  -> (batch_size*num_points, num_dims) #   batch_size * num_points * k + range(0, batch_size*num_points)
++    feature = x.view(batch_size*num_points, -1)[idx, :]
++    feature = feature.view(batch_size, num_points, k, num_dims, 3).mean(2, keepdim=False)
++    x = x.view(batch_size, num_points, num_dims, 3)
++    
++    feature = (feature-x).permute(0, 2, 3, 1).contiguous()
++  
++    return feature
++
++
++def get_shell_mean_cross(x, k=10, nk=4, idx_all=None):
++    batch_size = x.size(0)
++    num_points = x.size(3)
++    x = x.reshape(batch_size, -1, num_points).contiguous()
++    if idx_all is None:
++        idx_all = knn(x, k=nk*k)   # (batch_size, num_points, k)
++    device = x.device
++    
++    idx_base = torch.arange(0, batch_size, device=device).view(-1, 1, 1)*num_points
++    
++    idx = []
++    for i in range(nk):
++        idx.append(idx_all[:, :, i*k:(i+1)*k])
++        idx[i] = idx[i] + idx_base
++        idx[i] = idx[i].view(-1)
++ 
++    _, num_dims, _ = x.size()
++    num_dims = num_dims // 3
++
++    x = x.transpose(2, 1).contiguous()   # (batch_size, num_points, num_dims)  -> (batch_size*num_points, num_dims) #   batch_size * num_points * k + range(0, batch_size*num_points)
++    x = x.view(batch_size, num_points, num_dims, 3)
++    feature = []
++    for i in range(nk):
++        feature.append(x.view(batch_size*num_points, -1)[idx[i], :])
++        feature[i] = feature[i].view(batch_size, num_points, k, num_dims, 3).mean(2, keepdim=False)
++        feature[i] = feature[i] - x
++        cross = torch.cross(feature[i], x, dim=3)
++        feature[i] = torch.cat((feature[i], cross), dim=2)
++    
++    feature = torch.cat(feature, dim=2).permute(0, 2, 3, 1).contiguous()
++  
++    return feature
++
++
++class VNLinear(nn.Module):
++    def __init__(self, in_channels, out_channels):
++        super(VNLinear, self).__init__()
++        self.map_to_feat = nn.Linear(in_channels, out_channels, bias=False)
++    
++    def forward(self, x):
++        '''
++        x: point features of shape [B, N_feat, 3, N_samples, ...]
++        '''
++        x_out = self.map_to_feat(x.transpose(1,-1)).transpose(1,-1)
++        return x_out
++
++
++class VNLeakyReLU(nn.Module):
++    def __init__(self, in_channels, share_nonlinearity=False, negative_slope=0.2):
++        super(VNLeakyReLU, self).__init__()
++        if share_nonlinearity == True:
++            self.map_to_dir = nn.Linear(in_channels, 1, bias=False)
++        else:
++            self.map_to_dir = nn.Linear(in_channels, in_channels, bias=False)
++        self.negative_slope = negative_slope
++    
++    def forward(self, x):
++        '''
++        x: point features of shape [B, N_feat, 3, N_samples, ...]
++        '''
++        d = self.map_to_dir(x.transpose(1,-1)).transpose(1,-1)
++        dotprod = (x*d).sum(2, keepdim=True)
++        mask = (dotprod >= 0).float()
++        d_norm_sq = (d*d).sum(2, keepdim=True)
++        x_out = self.negative_slope * x + (1-self.negative_slope) * (mask*x + (1-mask)*(x-(dotprod/(d_norm_sq+EPS))*d))
++        return x_out
++
++
++class VNLinearLeakyReLU(nn.Module):
++    def __init__(self, in_channels, out_channels, dim=5, share_nonlinearity=False, use_batchnorm=True, negative_slope=0.2):
++        super(VNLinearLeakyReLU, self).__init__()
++        self.dim = dim
++        self.share_nonlinearity = share_nonlinearity
++        self.use_batchnorm = use_batchnorm
++        self.negative_slope = negative_slope
++        
++        # Conv
++        self.map_to_feat = nn.Linear(in_channels, out_channels, bias=False)
++        
++        # BatchNorm
++        self.use_batchnorm = use_batchnorm
++        if use_batchnorm == True:
++            self.batchnorm = VNBatchNorm(out_channels, dim=dim)
++        
++        # LeakyReLU
++        if share_nonlinearity == True:
++            self.map_to_dir = nn.Linear(in_channels, 1, bias=False)
++        else:
++            self.map_to_dir = nn.Linear(in_channels, out_channels, bias=False)
++        self.negative_slope = negative_slope
++    
++    def forward(self, x):
++        '''
++        x: point features of shape [B, N_feat, 3, N_samples, ...]
++        '''
++        # Conv
++        p = self.map_to_feat(x.transpose(1,-1)).transpose(1,-1)
++        # InstanceNorm
++        if self.use_batchnorm == True:
++            p = self.batchnorm(p)
++        # LeakyReLU
++        d = self.map_to_dir(x.transpose(1,-1)).transpose(1,-1)
++        dotprod = (p*d).sum(2, keepdim=True)
++        mask = (dotprod >= 0).float()
++        d_norm_sq = (d*d).sum(2, keepdim=True)
++        x_out = self.negative_slope * p + (1-self.negative_slope) * (mask*p + (1-mask)*(p-(dotprod/(d_norm_sq+EPS))*d))
++        return x_out
++
++
++class VNBatchNorm(nn.Module):
++    def __init__(self, num_features, dim):
++        super(VNBatchNorm, self).__init__()
++        self.dim = dim
++        if dim == 3 or dim == 4:
++            self.bn = nn.BatchNorm1d(num_features)
++        elif dim == 5:
++            self.bn = nn.BatchNorm2d(num_features)
++    
++    def forward(self, x):
++        '''
++        x: point features of shape [B, N_feat, 3, N_samples, ...]
++        '''
++        norm = torch.sqrt((x*x).sum(2))
++        norm_bn = self.bn(norm)
++        norm = norm.unsqueeze(2)
++        norm_bn = norm_bn.unsqueeze(2)
++        x = x / norm * norm_bn
++        
++        return x
++
++
++class VNMaxPool(nn.Module):
++    def __init__(self, in_channels, share_nonlinearity=False):
++        super(VNMaxPool, self).__init__()
++        if share_nonlinearity:
++            self.map_to_dir = nn.Linear(in_channels, 1, bias=False)
++        else:
++            self.map_to_dir = nn.Linear(in_channels, in_channels, bias=False)
++    
++    def forward(self, x):
++        '''
++        x: point features of shape [B, N_feat, 3, N_samples, ...]
++        '''
++        d = self.map_to_dir(x.transpose(1,-1)).transpose(1,-1)
++        dotprod = (x*d).sum(2, keepdim=True)
++        idx = dotprod.max(dim=-1, keepdim=False)[1]
++        index_tuple = torch.meshgrid([torch.arange(j) for j in x.size()[:-1]]) + (idx,)
++        x_max = x[index_tuple]
++        return x_max
++
++
++class VNStdFeature(nn.Module):
++    def __init__(self, in_channels, dim=4, normalize_frame=False, share_nonlinearity=False, use_batchnorm=True):
++        super(VNStdFeature, self).__init__()
++        self.dim = dim
++        self.normalize_frame = normalize_frame
++        self.share_nonlinearity = share_nonlinearity
++        self.use_batchnorm = use_batchnorm
++        
++        self.vn1 = VNLinearLeakyReLU(in_channels, in_channels//2, dim=dim, share_nonlinearity=share_nonlinearity, use_batchnorm=use_batchnorm)
++        self.vn2 = VNLinearLeakyReLU(in_channels//2, in_channels//4, dim=dim, share_nonlinearity=share_nonlinearity, use_batchnorm=use_batchnorm)
++        if normalize_frame:
++            self.vn_lin = nn.Linear(in_channels//4, 2, bias=False)
++        else:
++            self.vn_lin = nn.Linear(in_channels//4, 3, bias=False)
++    
++    def forward(self, x):
++        '''
++        x: point features of shape [B, N_feat, 3, N_samples, ...]
++        '''
++        z0 = self.vn1(x)
++        z0 = self.vn2(z0)
++        z0 = self.vn_lin(z0.transpose(1, -1)).transpose(1, -1)
++        
++        if self.normalize_frame:
++            # make z0 orthogonal. u2 = v2 - proj_u1(v2)
++            v1 = z0[:,0,:]
++            #u1 = F.normalize(v1, dim=1)
++            v1_norm = torch.sqrt((v1*v1).sum(1, keepdim=True))
++            u1 = v1 / (v1_norm+EPS)
++            v2 = z0[:,1,:]
++            v2 = v2 - (v2*u1).sum(1, keepdim=True)*u1
++            #u2 = F.normalize(u2, dim=1)
++            v2_norm = torch.sqrt((v2*v2).sum(1, keepdim=True))
++            u2 = v2 / (v2_norm+EPS)
++
++            # compute the cross product of the two output vectors       
++            u3 = torch.cross(u1, u2)
++            z0 = torch.stack([u1, u2, u3], dim=1).transpose(1, 2)
++        else:
++            z0 = z0.transpose(1, 2)
++        
++        if self.dim == 4:
++            x_std = torch.einsum('bijm,bjkm->bikm', x, z0)
++        elif self.dim == 3:
++            x_std = torch.einsum('bij,bjk->bik', x, z0)
++        elif self.dim == 5:
++            x_std = torch.einsum('bijmn,bjkmn->bikmn', x, z0)
++        
++        return x_std, z0
++
++
++# Resnet Blocks
++class VNResnetBlockFC(nn.Module):
++    ''' Fully connected ResNet Block class.
++
++    Args:
++        size_in (int): input dimension
++        size_out (int): output dimension
++        size_h (int): hidden dimension
++    '''
++
++    def __init__(self, size_in, size_out=None, size_h=None):
++        super().__init__()
++        # Attributes
++        if size_out is None:
++            size_out = size_in
++
++        if size_h is None:
++            size_h = min(size_in, size_out)
++
++        self.size_in = size_in
++        self.size_h = size_h
++        self.size_out = size_out
++        # Submodules
++        self.fc_0 = VNLinear(size_in, size_h)
++        self.fc_1 = VNLinear(size_h, size_out)
++        self.actvn_0 = VNLeakyReLU(size_in, negative_slope=0.2, share_nonlinearity=False)
++        self.actvn_1 = VNLeakyReLU(size_h, negative_slope=0.2, share_nonlinearity=False)
++
++        if size_in == size_out:
++            self.shortcut = None
++        else:
++            self.shortcut = VNLinear(size_in, size_out)
++        # Initialization
++        nn.init.zeros_(self.fc_1.map_to_feat.weight)
++
++    def forward(self, x):
++        net = self.fc_0(self.actvn_0(x))
++        dx = self.fc_1(self.actvn_1(net))
++
++        if self.shortcut is not None:
++            x_s = self.shortcut(x)
++        else:
++            x_s = x
++
++        return x_s + dx
++
+--- /dev/null
++++ b/modeling/ndf/vendor/network.py
+@@ -0,0 +1,833 @@
++import torch
++import torch.nn as nn
++from .layers_equi import *
++
++def maxpool(x, dim=-1, keepdim=False):
++    out, _ = x.max(dim=dim, keepdim=keepdim)
++    return out
++
++
++def meanpool(x, dim=-1, keepdim=False):
++    out = x.mean(dim=dim, keepdim=keepdim)
++    return out
++
++class VNN_DGCNN(nn.Module):
++    def __init__(self, c_dim=128, dim=3, hidden_dim=64, k=20):
++        super(VNN_DGCNN, self).__init__()
++        self.c_dim = c_dim
++        self.k = k
++
++        self.conv1 = VNLinearLeakyReLU(2, hidden_dim)
++        self.conv2 = VNLinearLeakyReLU(hidden_dim*2, hidden_dim)
++        self.conv3 = VNLinearLeakyReLU(hidden_dim*2, hidden_dim)
++        self.conv4 = VNLinearLeakyReLU(hidden_dim*2, hidden_dim)
++
++        self.pool1 = meanpool
++        self.pool2 = meanpool
++        self.pool3 = meanpool
++        self.pool4 = meanpool
++
++        self.conv_c = VNLinearLeakyReLU(hidden_dim*4, c_dim, dim=4, share_nonlinearity=True)
++
++    def forward(self, x):
++
++        batch_size = x.size(0)
++        x = x.unsqueeze(1).transpose(2, 3)
++        x = get_graph_feature(x, k=self.k)
++        x = self.conv1(x)
++        x1 = self.pool1(x)
++
++        x = get_graph_feature(x1, k=self.k)
++        x = self.conv2(x)
++        x2 = self.pool2(x)
++
++        x = get_graph_feature(x2, k=self.k)
++        x = self.conv3(x)
++        x3 = self.pool3(x)
++
++        x = get_graph_feature(x3, k=self.k)
++        x = self.conv4(x)
++        x4 = self.pool4(x)
++
++        x = torch.cat((x1, x2, x3, x4), dim=1)
++        x = self.conv_c(x)
++        x = x.mean(dim=-1, keepdim=False)
++
++        return x
++
++
++class VNNOccNet(nn.Module):
++    def __init__(self,
++                 latent_dim,
++                 model_type='pointnet',
++                 sigmoid=True,
++                 return_features=False, 
++                 acts='all',
++                 scaling=10.0):
++        super().__init__()
++
++        self.latent_dim = latent_dim
++        self.scaling = scaling  # scaling up the point cloud/query points to be larger helps
++        self.return_features = return_features
++
++        if model_type == 'dgcnn':
++            self.model_type = 'dgcnn'
++            self.encoder = VNN_DGCNN(c_dim=latent_dim) # modified resnet-18
++        else:
++            self.model_type = 'pointnet'
++            self.encoder = VNN_ResnetPointnet(c_dim=latent_dim) # modified resnet-18
++
++        self.decoder = DecoderInner(dim=3, z_dim=latent_dim, c_dim=0, hidden_size=latent_dim, leaky=True, sigmoid=sigmoid, return_features=return_features, acts=acts)
++
++
++    def forward(self, input):
++        out_dict = {}
++
++        enc_in = input['point_cloud'] * self.scaling 
++        query_points = input['coords'] * self.scaling 
++
++        z = self.encoder(enc_in)
++
++        if self.return_features:
++            out_dict['occ'], out_dict['features'] = self.decoder(query_points, z)
++        else:
++            out_dict['occ'] = self.decoder(query_points, z)
++
++        return out_dict
++
++    def extract_latent(self, input):
++        enc_in = input['point_cloud'] * self.scaling 
++        z = self.encoder(enc_in)
++        return z
++
++    def forward_latent(self, z, coords):
++        out_dict = {}
++        coords = coords * self.scaling 
++        out_dict['occ'], out_dict['features'] = self.decoder(coords, z)
++
++        return out_dict['features']
++
++class VNN_ResnetPointnet(nn.Module):
++    ''' DGCNN-based VNN encoder network with ResNet blocks.
++
++    Args:
++        c_dim (int): dimension of latent code c
++        dim (int): input points dimension
++        hidden_dim (int): hidden dimension of the network
++    '''
++
++    def __init__(self, c_dim=128, dim=3, hidden_dim=128, k=20, meta_output=None):
++        super().__init__()
++        self.c_dim = c_dim
++        self.k = k
++        self.meta_output = meta_output
++
++        self.conv_pos = VNLinearLeakyReLU(3, 128, negative_slope=0.2, share_nonlinearity=False, use_batchnorm=False)
++        self.fc_pos = VNLinear(128, 2*hidden_dim)
++        self.block_0 = VNResnetBlockFC(2*hidden_dim, hidden_dim)
++        self.block_1 = VNResnetBlockFC(2*hidden_dim, hidden_dim)
++        self.block_2 = VNResnetBlockFC(2*hidden_dim, hidden_dim)
++        self.block_3 = VNResnetBlockFC(2*hidden_dim, hidden_dim)
++        self.block_4 = VNResnetBlockFC(2*hidden_dim, hidden_dim)
++        self.fc_c = VNLinear(hidden_dim, c_dim)
++
++        self.actvn_c = VNLeakyReLU(hidden_dim, negative_slope=0.2, share_nonlinearity=False)
++        self.pool = meanpool
++
++        if meta_output == 'invariant_latent':
++            self.std_feature = VNStdFeature(c_dim, dim=3, normalize_frame=True, use_batchnorm=False)
++        elif meta_output == 'invariant_latent_linear':
++            self.std_feature = VNStdFeature(c_dim, dim=3, normalize_frame=True, use_batchnorm=False)
++            self.vn_inv = VNLinear(c_dim, 3)
++        elif meta_output == 'equivariant_latent_linear':
++            self.vn_inv = VNLinear(c_dim, 3)
++
++    def forward(self, p):
++        batch_size = p.size(0)
++        p = p.unsqueeze(1).transpose(2, 3)
++        #mean = get_graph_mean(p, k=self.k)
++        #mean = p_trans.mean(dim=-1, keepdim=True).expand(p_trans.size())
++        feat = get_graph_feature_cross(p, k=self.k)
++        net = self.conv_pos(feat)
++        net = self.pool(net, dim=-1)
++
++        net = self.fc_pos(net)
++
++        net = self.block_0(net)
++        pooled = self.pool(net, dim=-1, keepdim=True).expand(net.size())
++        net = torch.cat([net, pooled], dim=1)
++
++        net = self.block_1(net)
++        pooled = self.pool(net, dim=-1, keepdim=True).expand(net.size())
++        net = torch.cat([net, pooled], dim=1)
++
++        net = self.block_2(net)
++        pooled = self.pool(net, dim=-1, keepdim=True).expand(net.size())
++        net = torch.cat([net, pooled], dim=1)
++
++        net = self.block_3(net)
++        pooled = self.pool(net, dim=-1, keepdim=True).expand(net.size())
++        net = torch.cat([net, pooled], dim=1)
++
++        net = self.block_4(net)
++
++        # Recude to  B x F
++        net = self.pool(net, dim=-1)
++
++        c = self.fc_c(self.actvn_c(net))
++
++        if self.meta_output == 'invariant_latent':
++            c_std, z0 = self.std_feature(c)
++            return c, c_std
++        elif self.meta_output == 'invariant_latent_linear':
++            c_std, z0 = self.std_feature(c)
++            c_std = self.vn_inv(c_std)
++            return c, c_std
++        elif self.meta_output == 'equivariant_latent_linear':
++            c_std = self.vn_inv(c)
++            return c, c_std
++
++        return c
++
++
++class DecoderInner(nn.Module):
++    ''' Decoder class.
++
++    It does not perform any form of normalization.
++
++    Args:
++        dim (int): input dimension
++        z_dim (int): dimension of latent code z
++        c_dim (int): dimension of latent conditioned code c
++        hidden_size (int): hidden size of Decoder network
++        leaky (bool): whether to use leaky ReLUs
++    '''
++
++    def __init__(self, dim=3, z_dim=128, c_dim=128,
++                 hidden_size=128, leaky=False, return_features=False, sigmoid=True, acts='all'):
++        super().__init__()
++        self.z_dim = z_dim
++        self.c_dim = c_dim
++
++        self.acts = acts
++        if self.acts not in ['all', 'inp', 'first_rn', 'inp_first_rn']:
++            #self.acts = 'all'
++            raise ValueError('Please provide "acts" equal to one of the following: "all", "inp", "first_rn", "inp_first_rn"')
++
++        # Submodules
++        if z_dim > 0:
++            self.z_in = VNLinear(z_dim, z_dim)
++        if c_dim > 0:
++            self.c_in = VNLinear(c_dim, c_dim)
++
++        self.fc_in = nn.Linear(z_dim*2+c_dim*2+1, hidden_size)
++
++        self.block0 = ResnetBlockFC(hidden_size)
++        self.block1 = ResnetBlockFC(hidden_size)
++        self.block2 = ResnetBlockFC(hidden_size)
++        self.block3 = ResnetBlockFC(hidden_size)
++        self.block4 = ResnetBlockFC(hidden_size)
++        self.return_features = return_features
++
++        self.fc_out = nn.Linear(hidden_size, 1)
++        self.sigmoid = sigmoid
++
++        if not leaky:
++            self.actvn = F.relu
++        else:
++            self.actvn = lambda x: F.leaky_relu(x, 0.2)
++
++    def forward(self, p, z, c=None, **kwargs):
++        batch_size, T, D = p.size()
++        acts = []
++        acts_inp = []
++        acts_first_rn = []
++        acts_inp_first_rn = []
++
++        if isinstance(c, tuple):
++            c, c_meta = c
++
++        net = (p * p).sum(2, keepdim=True)
++
++        if self.z_dim != 0:
++            z = z.view(batch_size, -1, D).contiguous()
++            net_z = torch.einsum('bmi,bni->bmn', p, z)
++            z_dir = self.z_in(z)
++            z_inv = (z * z_dir).sum(-1).unsqueeze(1).repeat(1, T, 1)
++            net = torch.cat([net, net_z, z_inv], dim=2)
++
++        if self.c_dim != 0:
++            c = c.view(batch_size, -1, D).contiguous()
++            net_c = torch.einsum('bmi,bni->bmn', p, c)
++            c_dir = self.c_in(c)
++            c_inv = (c * c_dir).sum(-1).unsqueeze(1).repeat(1, T, 1)
++            net = torch.cat([net, net_c, c_inv], dim=2)
++
++        acts.append(net)
++        acts_inp.append(net)
++        acts_inp_first_rn.append(net)
++
++        net = self.fc_in(net)
++        acts.append(net)
++        # acts_inp.append(net)
++        # acts_inp_first_rn.append(net)
++
++        net = self.block0(net)
++        acts.append(net)
++        # acts_inp_first_rn.append(net)
++        acts_first_rn.append(net)
++
++        net = self.block1(net)
++        acts.append(net)
++        net = self.block2(net)
++        acts.append(net)
++        net = self.block3(net)
++        acts.append(net)
++        net = self.block4(net)
++        last_act = net
++        acts.append(net)
++
++        out = self.fc_out(self.actvn(net))
++        out = out.squeeze(-1)
++
++        if self.sigmoid:
++            out = F.sigmoid(out)
++
++        if self.return_features:
++            #acts = torch.cat(acts, dim=-1)
++            if self.acts == 'all':
++                acts = torch.cat(acts, dim=-1)
++            elif self.acts == 'inp':
++                acts = torch.cat(acts_inp, dim=-1)
++            elif self.acts == 'last':
++                acts = last_act
++            elif self.acts == 'inp_first_rn':
++                acts = torch.cat(acts_inp_first_rn, dim=-1)
++            acts = F.normalize(acts, p=2, dim=-1)
++            return out, acts
++        else:
++            return out
++
++
++class DecoderCBatchNorm(nn.Module):
++    ''' Decoder with conditional batch normalization (CBN) class.
++
++    Args:
++        dim (int): input dimension
++        z_dim (int): dimension of latent code z
++        c_dim (int): dimension of latent conditioned code c
++        hidden_size (int): hidden size of Decoder network
++        leaky (bool): whether to use leaky ReLUs
++        legacy (bool): whether to use the legacy structure
++    '''
++
++    def __init__(self, dim=3, z_dim=128, c_dim=128,
++                 hidden_size=256, leaky=False, legacy=False):
++        super().__init__()
++        self.z_dim = z_dim
++        if not z_dim == 0:
++            self.fc_z = nn.Linear(z_dim, hidden_size)
++
++        self.fc_p = nn.Conv1d(dim, hidden_size, 1)
++        self.block0 = CResnetBlockConv1d(c_dim, hidden_size, legacy=legacy)
++        self.block1 = CResnetBlockConv1d(c_dim, hidden_size, legacy=legacy)
++        self.block2 = CResnetBlockConv1d(c_dim, hidden_size, legacy=legacy)
++        self.block3 = CResnetBlockConv1d(c_dim, hidden_size, legacy=legacy)
++        self.block4 = CResnetBlockConv1d(c_dim, hidden_size, legacy=legacy)
++
++        if not legacy:
++            self.bn = CBatchNorm1d(c_dim, hidden_size)
++        else:
++            self.bn = CBatchNorm1d_legacy(c_dim, hidden_size)
++
++        self.fc_out = nn.Conv1d(hidden_size, 1, 1)
++
++        if not leaky:
++            self.actvn = F.relu
++        else:
++            self.actvn = lambda x: F.leaky_relu(x, 0.2)
++
++    def forward(self, p, z, c, **kwargs):
++        p = p.transpose(1, 2)
++        batch_size, D, T = p.size()
++        net = self.fc_p(p)
++
++        if self.z_dim != 0:
++            net_z = self.fc_z(z).unsqueeze(2)
++            net = net + net_z
++
++        net = self.block0(net, c)
++        net = self.block1(net, c)
++        net = self.block2(net, c)
++        net = self.block3(net, c)
++        net = self.block4(net, c)
++
++        out = self.fc_out(self.actvn(self.bn(net, c)))
++        out = out.squeeze(1)
++
++        return out
++
++
++class DecoderCBatchNorm2(nn.Module):
++    ''' Decoder with CBN class 2.
++
++    It differs from the previous one in that the number of blocks can be
++    chosen.
++
++    Args:
++        dim (int): input dimension
++        z_dim (int): dimension of latent code z
++        c_dim (int): dimension of latent conditioned code c
++        hidden_size (int): hidden size of Decoder network
++        leaky (bool): whether to use leaky ReLUs
++        n_blocks (int): number of ResNet blocks
++    '''
++
++    def __init__(self, dim=3, z_dim=0, c_dim=128,
++                 hidden_size=256, n_blocks=5):
++        super().__init__()
++        self.z_dim = z_dim
++        if z_dim != 0:
++            self.fc_z = nn.Linear(z_dim, c_dim)
++
++        self.conv_p = nn.Conv1d(dim, hidden_size, 1)
++        self.blocks = nn.ModuleList([
++            CResnetBlockConv1d(c_dim, hidden_size) for i in range(n_blocks)
++        ])
++
++        self.bn = CBatchNorm1d(c_dim, hidden_size)
++        self.conv_out = nn.Conv1d(hidden_size, 1, 1)
++        self.actvn = nn.ReLU()
++
++    def forward(self, p, z, c, **kwargs):
++        p = p.transpose(1, 2)
++        batch_size, D, T = p.size()
++        net = self.conv_p(p)
++
++        if self.z_dim != 0:
++            c = c + self.fc_z(z)
++
++        for block in self.blocks:
++            net = block(net, c)
++
++        out = self.conv_out(self.actvn(self.bn(net, c)))
++        out = out.squeeze(1)
++
++        return out
++
++
++class DecoderCBatchNormNoResnet(nn.Module):
++    ''' Decoder CBN with no ResNet blocks class.
++
++    Args:
++        dim (int): input dimension
++        z_dim (int): dimension of latent code z
++        c_dim (int): dimension of latent conditioned code c
++        hidden_size (int): hidden size of Decoder network
++        leaky (bool): whether to use leaky ReLUs
++    '''
++
++    def __init__(self, dim=3, z_dim=128, c_dim=128,
++                 hidden_size=256, leaky=False):
++        super().__init__()
++        self.z_dim = z_dim
++        if not z_dim == 0:
++            self.fc_z = nn.Linear(z_dim, hidden_size)
++
++        self.fc_p = nn.Conv1d(dim, hidden_size, 1)
++        self.fc_0 = nn.Conv1d(hidden_size, hidden_size, 1)
++        self.fc_1 = nn.Conv1d(hidden_size, hidden_size, 1)
++        self.fc_2 = nn.Conv1d(hidden_size, hidden_size, 1)
++        self.fc_3 = nn.Conv1d(hidden_size, hidden_size, 1)
++        self.fc_4 = nn.Conv1d(hidden_size, hidden_size, 1)
++
++        self.bn_0 = CBatchNorm1d(c_dim, hidden_size)
++        self.bn_1 = CBatchNorm1d(c_dim, hidden_size)
++        self.bn_2 = CBatchNorm1d(c_dim, hidden_size)
++        self.bn_3 = CBatchNorm1d(c_dim, hidden_size)
++        self.bn_4 = CBatchNorm1d(c_dim, hidden_size)
++        self.bn_5 = CBatchNorm1d(c_dim, hidden_size)
++
++        self.fc_out = nn.Conv1d(hidden_size, 1, 1)
++
++        if not leaky:
++            self.actvn = F.relu
++        else:
++            self.actvn = lambda x: F.leaky_relu(x, 0.2)
++
++    def forward(self, p, z, c, **kwargs):
++        p = p.transpose(1, 2)
++        batch_size, D, T = p.size()
++        net = self.fc_p(p)
++
++        if self.z_dim != 0:
++            net_z = self.fc_z(z).unsqueeze(2)
++            net = net + net_z
++
++        net = self.actvn(self.bn_0(net, c))
++        net = self.fc_0(net)
++        net = self.actvn(self.bn_1(net, c))
++        net = self.fc_1(net)
++        net = self.actvn(self.bn_2(net, c))
++        net = self.fc_2(net)
++        net = self.actvn(self.bn_3(net, c))
++        net = self.fc_3(net)
++        net = self.actvn(self.bn_4(net, c))
++        net = self.fc_4(net)
++        net = self.actvn(self.bn_5(net, c))
++        out = self.fc_out(net)
++        out = out.squeeze(1)
++
++        return out
++
++
++class DecoderBatchNorm(nn.Module):
++    ''' Decoder with batch normalization class.
++
++    Args:
++        dim (int): input dimension
++        z_dim (int): dimension of latent code z
++        c_dim (int): dimension of latent conditioned code c
++        hidden_size (int): hidden size of Decoder network
++        leaky (bool): whether to use leaky ReLUs
++    '''
++
++    def __init__(self, dim=3, z_dim=128, c_dim=128,
++                 hidden_size=256, leaky=False):
++        super().__init__()
++        self.z_dim = z_dim
++        self.c_dim = c_dim
++
++        # Submodules
++        if not z_dim == 0:
++            self.fc_z = nn.Linear(z_dim, hidden_size)
++
++        if self.c_dim != 0:
++            self.fc_c = nn.Linear(c_dim, hidden_size)
++        self.fc_p = nn.Conv1d(dim, hidden_size, 1)
++        self.block0 = ResnetBlockConv1d(hidden_size)
++        self.block1 = ResnetBlockConv1d(hidden_size)
++        self.block2 = ResnetBlockConv1d(hidden_size)
++        self.block3 = ResnetBlockConv1d(hidden_size)
++        self.block4 = ResnetBlockConv1d(hidden_size)
++
++        self.bn = nn.BatchNorm1d(hidden_size)
++
++        self.fc_out = nn.Conv1d(hidden_size, 1, 1)
++
++        if not leaky:
++            self.actvn = F.relu
++        else:
++            self.actvn = lambda x: F.leaky_relu(x, 0.2)
++
++    def forward(self, p, z, c, **kwargs):
++        p = p.transpose(1, 2)
++        batch_size, D, T = p.size()
++        net = self.fc_p(p)
++
++        if self.z_dim != 0:
++            net_z = self.fc_z(z).unsqueeze(2)
++            net = net + net_z
++
++        if self.c_dim != 0:
++            net_c = self.fc_c(c).unsqueeze(2)
++            net = net + net_c
++
++        net = self.block0(net)
++        net = self.block1(net)
++        net = self.block2(net)
++        net = self.block3(net)
++        net = self.block4(net)
++
++        out = self.fc_out(self.actvn(self.bn(net)))
++        out = out.squeeze(1)
++
++        return out
++
++
++# Resnet Blocks
++class ResnetBlockFC(nn.Module):
++    ''' Fully connected ResNet Block class.
++
++    Args:
++        size_in (int): input dimension
++        size_out (int): output dimension
++        size_h (int): hidden dimension
++    '''
++
++    def __init__(self, size_in, size_out=None, size_h=None):
++        super().__init__()
++        # Attributes
++        if size_out is None:
++            size_out = size_in
++
++        if size_h is None:
++            size_h = min(size_in, size_out)
++
++        self.size_in = size_in
++        self.size_h = size_h
++        self.size_out = size_out
++        # Submodules
++        self.fc_0 = nn.Linear(size_in, size_h)
++        self.fc_1 = nn.Linear(size_h, size_out)
++        self.actvn = nn.ReLU()
++
++        if size_in == size_out:
++            self.shortcut = None
++        else:
++            self.shortcut = nn.Linear(size_in, size_out, bias=False)
++        # Initialization
++        nn.init.zeros_(self.fc_1.weight)
++
++    def forward(self, x):
++        net = self.fc_0(self.actvn(x))
++        dx = self.fc_1(self.actvn(net))
++
++        if self.shortcut is not None:
++            x_s = self.shortcut(x)
++        else:
++            x_s = x
++
++        return x_s + dx
++
++
++class CResnetBlockConv1d(nn.Module):
++    ''' Conditional batch normalization-based Resnet block class.
++
++    Args:
++        c_dim (int): dimension of latend conditioned code c
++        size_in (int): input dimension
++        size_out (int): output dimension
++        size_h (int): hidden dimension
++        norm_method (str): normalization method
++        legacy (bool): whether to use legacy blocks 
++    '''
++
++    def __init__(self, c_dim, size_in, size_h=None, size_out=None,
++                 norm_method='batch_norm', legacy=False):
++        super().__init__()
++        # Attributes
++        if size_h is None:
++            size_h = size_in
++        if size_out is None:
++            size_out = size_in
++
++        self.size_in = size_in
++        self.size_h = size_h
++        self.size_out = size_out
++        # Submodules
++        if not legacy:
++            self.bn_0 = CBatchNorm1d(
++                c_dim, size_in, norm_method=norm_method)
++            self.bn_1 = CBatchNorm1d(
++                c_dim, size_h, norm_method=norm_method)
++        else:
++            self.bn_0 = CBatchNorm1d_legacy(
++                c_dim, size_in, norm_method=norm_method)
++            self.bn_1 = CBatchNorm1d_legacy(
++                c_dim, size_h, norm_method=norm_method)
++
++        self.fc_0 = nn.Conv1d(size_in, size_h, 1)
++        self.fc_1 = nn.Conv1d(size_h, size_out, 1)
++        self.actvn = nn.ReLU()
++
++        if size_in == size_out:
++            self.shortcut = None
++        else:
++            self.shortcut = nn.Conv1d(size_in, size_out, 1, bias=False)
++        # Initialization
++        nn.init.zeros_(self.fc_1.weight)
++
++    def forward(self, x, c):
++        net = self.fc_0(self.actvn(self.bn_0(x, c)))
++        dx = self.fc_1(self.actvn(self.bn_1(net, c)))
++
++        if self.shortcut is not None:
++            x_s = self.shortcut(x)
++        else:
++            x_s = x
++
++        return x_s + dx
++
++
++class ResnetBlockConv1d(nn.Module):
++    ''' 1D-Convolutional ResNet block class.
++
++    Args:
++        size_in (int): input dimension
++        size_out (int): output dimension
++        size_h (int): hidden dimension
++    '''
++
++    def __init__(self, size_in, size_h=None, size_out=None):
++        super().__init__()
++        # Attributes
++        if size_h is None:
++            size_h = size_in
++        if size_out is None:
++            size_out = size_in
++
++        self.size_in = size_in
++        self.size_h = size_h
++        self.size_out = size_out
++        # Submodules
++        self.bn_0 = nn.BatchNorm1d(size_in)
++        self.bn_1 = nn.BatchNorm1d(size_h)
++
++        self.fc_0 = nn.Conv1d(size_in, size_h, 1)
++        self.fc_1 = nn.Conv1d(size_h, size_out, 1)
++        self.actvn = nn.ReLU()
++
++        if size_in == size_out:
++            self.shortcut = None
++        else:
++            self.shortcut = nn.Conv1d(size_in, size_out, 1, bias=False)
++
++        # Initialization
++        nn.init.zeros_(self.fc_1.weight)
++
++    def forward(self, x):
++        net = self.fc_0(self.actvn(self.bn_0(x)))
++        dx = self.fc_1(self.actvn(self.bn_1(net)))
++
++        if self.shortcut is not None:
++            x_s = self.shortcut(x)
++        else:
++            x_s = x
++
++        return x_s + dx
++
++
++# Utility modules
++class AffineLayer(nn.Module):
++    ''' Affine layer class.
++
++    Args:
++        c_dim (tensor): dimension of latent conditioned code c
++        dim (int): input dimension
++    '''
++
++    def __init__(self, c_dim, dim=3):
++        super().__init__()
++        self.c_dim = c_dim
++        self.dim = dim
++        # Submodules
++        self.fc_A = nn.Linear(c_dim, dim * dim)
++        self.fc_b = nn.Linear(c_dim, dim)
++        self.reset_parameters()
++
++    def reset_parameters(self):
++        nn.init.zeros_(self.fc_A.weight)
++        nn.init.zeros_(self.fc_b.weight)
++        with torch.no_grad():
++            self.fc_A.bias.copy_(torch.eye(3).view(-1))
++            self.fc_b.bias.copy_(torch.tensor([0., 0., 2.]))
++
++    def forward(self, x, p):
++        assert(x.size(0) == p.size(0))
++        assert(p.size(2) == self.dim)
++        batch_size = x.size(0)
++        A = self.fc_A(x).view(batch_size, 3, 3)
++        b = self.fc_b(x).view(batch_size, 1, 3)
++        out = p @ A + b
++        return out
++
++
++class CBatchNorm1d(nn.Module):
++    ''' Conditional batch normalization layer class.
++
++    Args:
++        c_dim (int): dimension of latent conditioned code c
++        f_dim (int): feature dimension
++        norm_method (str): normalization method
++    '''
++
++    def __init__(self, c_dim, f_dim, norm_method='batch_norm'):
++        super().__init__()
++        self.c_dim = c_dim
++        self.f_dim = f_dim
++        self.norm_method = norm_method
++        # Submodules
++        self.conv_gamma = nn.Conv1d(c_dim, f_dim, 1)
++        self.conv_beta = nn.Conv1d(c_dim, f_dim, 1)
++        if norm_method == 'batch_norm':
++            self.bn = nn.BatchNorm1d(f_dim, affine=False)
++        elif norm_method == 'instance_norm':
++            self.bn = nn.InstanceNorm1d(f_dim, affine=False)
++        elif norm_method == 'group_norm':
++            self.bn = nn.GroupNorm1d(f_dim, affine=False)
++        else:
++            raise ValueError('Invalid normalization method!')
++        self.reset_parameters()
++
++    def reset_parameters(self):
++        nn.init.zeros_(self.conv_gamma.weight)
++        nn.init.zeros_(self.conv_beta.weight)
++        nn.init.ones_(self.conv_gamma.bias)
++        nn.init.zeros_(self.conv_beta.bias)
++
++    def forward(self, x, c):
++        assert(x.size(0) == c.size(0))
++        assert(c.size(1) == self.c_dim)
++
++        # c is assumed to be of size batch_size x c_dim x T
++        if len(c.size()) == 2:
++            c = c.unsqueeze(2)
++
++        # Affine mapping
++        gamma = self.conv_gamma(c)
++        beta = self.conv_beta(c)
++
++        # Batchnorm
++        net = self.bn(x)
++        out = gamma * net + beta
++
++        return out
++
++
++class CBatchNorm1d_legacy(nn.Module):
++    ''' Conditional batch normalization legacy layer class.
++
++    Args:
++        c_dim (int): dimension of latent conditioned code c
++        f_dim (int): feature dimension
++        norm_method (str): normalization method
++    '''
++
++    def __init__(self, c_dim, f_dim, norm_method='batch_norm'):
++        super().__init__()
++        self.c_dim = c_dim
++        self.f_dim = f_dim
++        self.norm_method = norm_method
++        # Submodules
++        self.fc_gamma = nn.Linear(c_dim, f_dim)
++        self.fc_beta = nn.Linear(c_dim, f_dim)
++        if norm_method == 'batch_norm':
++            self.bn = nn.BatchNorm1d(f_dim, affine=False)
++        elif norm_method == 'instance_norm':
++            self.bn = nn.InstanceNorm1d(f_dim, affine=False)
++        elif norm_method == 'group_norm':
++            self.bn = nn.GroupNorm1d(f_dim, affine=False)
++        else:
++            raise ValueError('Invalid normalization method!')
++        self.reset_parameters()
++
++    def reset_parameters(self):
++        nn.init.zeros_(self.fc_gamma.weight)
++        nn.init.zeros_(self.fc_beta.weight)
++        nn.init.ones_(self.fc_gamma.bias)
++        nn.init.zeros_(self.fc_beta.bias)
++
++    def forward(self, x, c):
++        batch_size = x.size(0)
++        # Affine mapping
++        gamma = self.fc_gamma(c)
++        beta = self.fc_beta(c)
++        gamma = gamma.view(batch_size, self.f_dim, 1)
++        beta = beta.view(batch_size, self.f_dim, 1)
++        # Batchnorm
++        net = self.bn(x)
++        out = gamma * net + beta
++
++        return out
++
+--- a/modeling/policy/denoise_actor_3d.py
++++ b/modeling/policy/denoise_actor_3d.py
+@@ -29,7 +29,9 @@
+                  denoise_timesteps=100,
+                  denoise_model="ddpm",
+                  # Training arguments
+-                 lv2_batch_size=1):
++                 lv2_batch_size=1,
++                 ndf_config=None,
++                 ndf_load_pretrained=True):
+         super().__init__(
+             embedding_dim=embedding_dim,
+             num_attn_heads=num_attn_heads,
+@@ -52,7 +54,9 @@
+             num_vis_instr_attn_layers=num_vis_instr_attn_layers,
+             fps_subsampling_factor=fps_subsampling_factor,
+             finetune_backbone=finetune_backbone,
+-            finetune_text_encoder=finetune_text_encoder
++            finetune_text_encoder=finetune_text_encoder,
++            ndf_config=ndf_config,
++            ndf_load_pretrained=ndf_load_pretrained
+         )
+ 
+         # Action decoder, runs at every denoising timestep
+--- a/online_evaluation_rlbench/evaluate_policy.py
++++ b/online_evaluation_rlbench/evaluate_policy.py
+@@ -60,6 +60,12 @@
+ def load_models(args):
+     print("Loading model from", args.checkpoint, flush=True)
+ 
++    model_dict = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
++    for key, value in model_dict.get("model_config", {}).items():
++        setattr(args, key, value)
++    ndf_kwargs = {}
++    if model_dict.get("ndf_config") is not None:
++        ndf_kwargs = dict(ndf_config=model_dict["ndf_config"], ndf_load_pretrained=False)
+     model_class = fetch_model_class(args.model_type)
+     model = model_class(
+         backbone=args.backbone,
+@@ -73,18 +79,16 @@
+         relative=args.relative_action,
+         rotation_format=args.rotation_format,
+         denoise_timesteps=args.denoise_timesteps,
+-        denoise_model=args.denoise_model
++        denoise_model=args.denoise_model,
++        **ndf_kwargs
+     )
+ 
+     # Load model weights
+-    model_dict = torch.load(
+-        args.checkpoint, map_location="cpu", weights_only=True
+-    )
+     model_dict_weight = {}
+     for key in model_dict["weight"]:
+-        _key = key[7:]
++        _key = key.removeprefix("module.")
+         model_dict_weight[_key] = model_dict["weight"][key]
+-    model.load_state_dict(model_dict_weight, strict=False)
++    model.load_state_dict(model_dict_weight, strict="model_config" in model_dict)
+     model.eval()
+ 
+     return model.cuda()
+@@ -100,6 +104,8 @@
+     # Save results here
+     os.makedirs(os.path.dirname(args.output_file), exist_ok=True)
+ 
++    model = load_models(args)
++
+     # Bimanual vs single-arm utils
+     if args.bimanual:
+         from online_evaluation_rlbench.utils_with_bimanual_rlbench import RLBenchEnv, Actioner
+@@ -111,8 +117,6 @@
+     # Dataset class (for getting cameras and tasks/variations)
+     dataset_class = fetch_dataset_class(args.dataset)
+ 
+-    # Load models
+-    model = load_models(args)
+     # print(model.workspace_normalizer)
+ 
+     # Evaluate - reload environment for each task (crashes otherwise)
+--- /dev/null
++++ b/requirements-ndf.txt
+@@ -0,0 +1,16 @@
++# Proposed reproducible top-level dependency set, not a verified environment lock.
++# torch/torchvision are installed separately for the target CUDA architecture.
++numpy==1.26.4
++scipy==1.13.1
++einops==0.8.0
++tqdm==4.66.5
++transformers==4.44.2
++huggingface-hub==0.25.2
++diffusers==0.30.3
++kornia==0.7.3
++tensorboard==2.17.1
++zarr==2.18.3
++numcodecs==0.12.1
++blosc==1.11.2
++ftfy==6.2.3
++regex==2024.7.24
+--- /dev/null
++++ b/scripts/rlbench/download_ndf_weights.sh
+@@ -0,0 +1,12 @@
++#!/usr/bin/env bash
++set -euo pipefail
++cd "$(dirname "${BASH_SOURCE[0]}")/../.."
++mkdir -p checkpoints
++target=checkpoints/multi_category_weights.pth
++if [[ -e "$target" ]]; then echo "Keeping existing $target"; exit 0; fi
++# Official URL from the uploaded ndf_robot/scripts/download_demo_weights.sh.
++curl --fail --location --retry 3 \
++  'https://www.dropbox.com/s/hm4hty56ldu1wb5/multi_category_weights.pth?dl=1' \
++  --output "${target}.part"
++mv "${target}.part" "$target"
++echo 'Run python -m tools.check_ndf --device cuda to verify the downloaded weights.'
+--- /dev/null
++++ b/scripts/rlbench/train_peract_ndf.sh
+@@ -0,0 +1,110 @@
++#!/usr/bin/env bash
++set -euo pipefail
++cd "$(dirname "${BASH_SOURCE[0]}")/../.."
++task=${TASK:-push_buttons}
++mode=${MODE:-ndf}
++case "$mode" in ndf|baseline) ;; *) echo 'MODE must be ndf or baseline' >&2; exit 2;; esac
++ndf_args=()
++if [[ "$mode" == ndf ]]; then ndf_args=(--ndf_config "${NDF_CONFIG:-configs/ndf.json}"); fi
++entry=(main.py)
++if [[ "${SMOKE_ONLY:-0}" == 1 ]]; then entry=(--module tools.smoke_train); fi
++main_dir=${EXP_NAME:-Peract_${task}_${mode}}
++
++dataset_dir=${DATASET_DIR:-zarr_datasets/peract_${task}}
++train_data_dir=$dataset_dir/train.zarr/
++eval_data_dir=$dataset_dir/val.zarr/
++train_instructions=instructions/peract/instructions.json
++val_instructions=instructions/peract/instructions.json
++
++dataset=PeractTwoCam
++num_workers=1
++B=16  # tested on a single 15 GB Tesla T4
++B_val=16
++chunk_size=1
++memory_limit=0.5  # cache limit in GB per worker; fits a 16 GB host
++
++# Training/testing arguments
++val_freq=4000
++eval_only=false
++lr=1e-4
++backbone_lr=1e-6  # doesn't matter when we don't finetune
++lr_scheduler=constant
++wd=1e-10
++train_iters=${TRAIN_ITERS:-300000}
++use_compile=false  # much faster, but sometimes unstable
++use_ema=false
++lv2_batch_size=1  # you can increase this and divide B equally, speed/accuracy tradeoff
++
++# Model arguments, change (some of) these for new architectures
++model_type=denoise3d
++bimanual=false
++keypose_only=true
++pre_tokenize=true
++workspace_normalizer_buffer=0.04
++
++backbone=clip
++finetune_backbone=false
++finetune_text_encoder=false
++fps_subsampling_factor=4
++
++C=120
++num_attn_heads=8
++num_vis_instr_attn_layers=2
++num_history=3
++
++num_shared_attn_layers=4
++relative_action=false
++rotation_format=quat_xyzw
++denoise_timesteps=5
++denoise_model=rectified_flow
++
++run_log_dir=$model_type-$dataset-C$C-B$B-lr$lr-$lr_scheduler-H$num_history-$denoise_model
++checkpoint=train_logs/${main_dir}/${run_log_dir}/last.pth
++
++
++ngpus=${NGPUS:-1}  # changing this changes the global batch (16 per GPU)
++
++torchrun --nproc_per_node $ngpus --master_port $RANDOM \
++    "${entry[@]}" \
++    --train_data_dir "$train_data_dir" \
++    --eval_data_dir "$eval_data_dir" \
++    --train_instructions "$train_instructions" \
++    --val_instructions "$val_instructions" \
++    --dataset $dataset \
++    --num_workers $num_workers \
++    --batch_size $B \
++    --batch_size_val $B_val \
++    --chunk_size $chunk_size \
++    --memory_limit $memory_limit \
++    --exp_log_dir "$main_dir" \
++    --run_log_dir "${run_log_dir}" \
++    --checkpoint "$checkpoint" \
++    --val_freq $val_freq \
++    --eval_only $eval_only \
++    --lr $lr \
++    --backbone_lr $backbone_lr \
++    --lr_scheduler $lr_scheduler \
++    --wd $wd \
++    --train_iters $train_iters \
++    --use_compile $use_compile \
++    --use_ema $use_ema \
++    --lv2_batch_size $lv2_batch_size \
++    --model_type $model_type \
++    --bimanual $bimanual \
++    --keypose_only $keypose_only \
++    --pre_tokenize $pre_tokenize \
++    --backbone $backbone \
++    --finetune_backbone $finetune_backbone \
++    --finetune_text_encoder $finetune_text_encoder \
++    --fps_subsampling_factor $fps_subsampling_factor \
++    --embedding_dim $C \
++    --num_attn_heads $num_attn_heads \
++    --num_vis_instr_attn_layers $num_vis_instr_attn_layers \
++    --num_history $num_history \
++    --num_shared_attn_layers $num_shared_attn_layers \
++    --workspace_normalizer_buffer $workspace_normalizer_buffer \
++    --relative_action $relative_action \
++    --rotation_format $rotation_format \
++    --denoise_timesteps $denoise_timesteps \
++    --denoise_model $denoise_model \
++    "${ndf_args[@]}"
+--- /dev/null
++++ b/tests/test_configuration.py
+@@ -0,0 +1,30 @@
++import json
++from pathlib import Path
++import tempfile
++from types import SimpleNamespace
++import unittest
++from modeling.ndf.config import NDFConfig, MODEL_KEYS, metadata, check_resume
++
++
++class ConfigurationTests(unittest.TestCase):
++    def test_relative_checkpoint_path(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            p=Path(tmp)/'ndf.json'
++            p.write_text(json.dumps({'checkpoint':'weights.pth'}))
++            self.assertEqual(NDFConfig.read(p).checkpoint,str(Path(tmp)/'weights.pth'))
++
++    def test_bad_settings(self):
++        for kw in ({'num_points':19},{'latent_dim':0},{'query_chunk_size':0},{'scaling':float('nan')}):
++            with self.subTest(kw=kw), self.assertRaises(ValueError): NDFConfig(**kw)
++
++    def test_resume_rejects_different_architecture_or_missing_ndf(self):
++        a=SimpleNamespace(**{k:0 for k in MODEL_KEYS},ndf_settings=NDFConfig().to_dict())
++        saved=metadata(a)
++        check_resume(saved,a)
++        a.ndf_settings={**a.ndf_settings,'checkpoint':'moved.pth'}
++        check_resume(saved,a)
++        a.ndf_settings=None
++        with self.assertRaises(ValueError): check_resume(saved,a)
++        a.ndf_settings=NDFConfig().to_dict()
++        a.embedding_dim=120
++        with self.assertRaises(ValueError): check_resume(saved,a)
+--- /dev/null
++++ b/tests/test_frozen_fusion.py
+@@ -0,0 +1,74 @@
++import importlib.util
++from pathlib import Path
++import tempfile
++import unittest
++
++HAS_TORCH=importlib.util.find_spec('torch') is not None
++if HAS_TORCH:
++    import torch
++    from modeling.ndf.config import NDFConfig
++    from modeling.ndf.fusion import FrozenNDFFusion
++
++
++@unittest.skipUnless(HAS_TORCH,'PyTorch unavailable')
++class FrozenFusionTests(unittest.TestCase):
++    def setUp(self):
++        torch.manual_seed(7)
++        torch.set_num_threads(1)
++        self.config=NDFConfig(latent_dim=8,num_points=32,query_chunk_size=3)
++        self.model=FrozenNDFFusion(12,self.config,load_pretrained=False)
++        self.pcd=torch.randn(2,1,3,8,8)*.08
++        self.q=torch.randn(2,9,3)*.08
++        self.visual=torch.randn(2,9,12,requires_grad=True)
++
++    def test_identity_initialization_and_gradients(self):
++        self.model.train()
++        result=self.model(self.pcd,self.q,self.visual)
++        torch.testing.assert_close(result,self.visual)
++        result.square().mean().backward()
++        self.assertIsNotNone(self.visual.grad)
++        self.assertGreater(self.model.fusion.weight.grad[:,12:].abs().sum().item(),0)
++        self.assertFalse(self.model.field.training)
++        self.assertTrue(all(p.grad is None and not p.requires_grad for p in self.model.field.parameters()))
++
++    def test_frozen_weights_and_buffers_unchanged_after_optimizer(self):
++        self.model.train()
++        before={k:v.clone() for k,v in self.model.field.state_dict().items()}
++        opt=torch.optim.AdamW([p for p in self.model.parameters() if p.requires_grad],lr=1e-4)
++        self.model(self.pcd,self.q,self.visual).square().mean().backward()
++        opt.step()
++        self.assertTrue(all(torch.equal(v,before[k]) for k,v in self.model.field.state_dict().items()))
++
++    def test_descriptor_invariance(self):
++        p=self.pcd[0].permute(0,2,3,1).reshape(-1,3)
++        q=self.q[:1]
++        r,_=torch.linalg.qr(torch.randn(3,3));r[:,-1]*=torch.det(r)
++        t=torch.tensor([.2,.3,-.1])
++        z,c=self.model.encode_cloud(p)
++        z2,c2=self.model.encode_cloud(p@r.T+t)
++        torch.testing.assert_close(self.model.describe(z,c,q),self.model.describe(z2,c2,q@r.T+t),atol=3e-4,rtol=3e-3)
++
++    def test_chunking_matches_nonchunked_fusion(self):
++        other=FrozenNDFFusion(12,NDFConfig(latent_dim=8,num_points=32,query_chunk_size=100),False)
++        with torch.no_grad(): self.model.fusion.weight.normal_(0,.05)
++        other.load_state_dict(self.model.state_dict())
++        torch.testing.assert_close(self.model(self.pcd,self.q,self.visual),other(self.pcd,self.q,self.visual))
++
++    def test_new_input_changes_fused_output_when_ndf_weights_nonzero(self):
++        with torch.no_grad(): self.model.fusion.weight[:,12:].normal_(0,.1)
++        a=self.model(self.pcd,self.q,self.visual)
++        b=self.model(self.pcd,self.q+.1,self.visual)
++        self.assertGreater((a-b).abs().max().item(),1e-5)
++
++    def test_missing_pretrained_and_bad_geometry_fail(self):
++        with self.assertRaises(FileNotFoundError): FrozenNDFFusion(12,self.config)
++        with self.assertRaises(ValueError): self.model(torch.full_like(self.pcd,float('nan')),self.q,self.visual)
++        with self.assertRaises(ValueError): self.model(self.pcd,self.q[:,:2],self.visual)
++
++    def test_state_restore_without_external_ndf_file(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            path=Path(tmp)/'state.pth'
++            torch.save(self.model.state_dict(),path)
++            restored=FrozenNDFFusion(12,self.config,False)
++            restored.load_state_dict(torch.load(path,weights_only=True),strict=True)
++            torch.testing.assert_close(self.model(self.pcd,self.q,self.visual),restored(self.pcd,self.q,self.visual))
+--- /dev/null
++++ b/tests/test_training_arguments.py
+@@ -0,0 +1,65 @@
++"""Compare the commands emitted by original and NDF launchers, not copied constants."""
++import ast
++import argparse
++import json
++import os
++from pathlib import Path
++import subprocess
++import tempfile
++import unittest
++from unittest.mock import patch
++import sys
++
++ROOT=Path(__file__).resolve().parents[1]
++
++
++class TrainingArgumentTests(unittest.TestCase):
++    def command(self,script,**extra):
++        with tempfile.TemporaryDirectory() as tmp:
++            tool=Path(tmp)/'torchrun'
++            tool.write_text('#!/usr/bin/env python3\nimport sys,json,os\nopen(os.environ["CAPTURE"],"w").write(json.dumps(sys.argv[1:]))\n')
++            tool.chmod(0o755)
++            output=Path(tmp)/'args.json'
++            env=dict(os.environ,PATH=tmp+os.pathsep+os.environ['PATH'],CAPTURE=str(output))
++            for name in ('MODE','TASK','NDF_CONFIG','SMOKE_ONLY','TRAIN_ITERS','NGPUS','EXP_NAME','DATASET_DIR'):
++                env.pop(name,None)
++            env.update(extra)
++            subprocess.run(['bash',str(ROOT/'scripts/rlbench'/script)],cwd=ROOT,env=env,check=True)
++            return json.loads(output.read_text())
++
++    def parse(self,arguments):
++        tree=ast.parse((ROOT/'main.py').read_text())
++        fn=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='parse_arguments')
++        env={'argparse':argparse,'Path':Path,'__file__':str(ROOT/'main.py'),
++             'str2bool':lambda v:v.lower()=='true','str_none':lambda v:None if v=='None' else v}
++        exec(compile(ast.Module(body=[fn],type_ignores=[]),'main.py','exec'),env)
++        start=arguments.index('main.py')+1
++        with patch.object(sys,'argv',['main.py']+arguments[start:]):
++            return vars(env['parse_arguments']())
++
++    def test_all_training_parameters_match_uploaded_launcher(self):
++        original=self.parse(self.command('train_peract.sh'))
++        new=self.parse(self.command('train_peract_ndf.sh'))
++        allowed={'train_data_dir','eval_data_dir','exp_log_dir','checkpoint','ndf_config'}
++        differences={k for k in original if original[k]!=new[k]}
++        self.assertEqual(differences,allowed)
++        self.assertEqual(new['batch_size'],16)
++        self.assertEqual(new['train_iters'],300000)
++        self.assertEqual(new['ndf_config'],'configs/ndf.json')
++
++    def test_baseline_mode_and_paths_with_spaces(self):
++        args=self.parse(self.command('train_peract_ndf.sh',MODE='baseline',DATASET_DIR='/data/my dataset',EXP_NAME='baseline test'))
++        self.assertIsNone(args['ndf_config'])
++        self.assertEqual(args['train_data_dir'],Path('/data/my dataset/train.zarr'))
++        self.assertEqual(args['exp_log_dir'],Path('baseline test'))
++
++    def test_task_and_gpu_selection(self):
++        command=self.command('train_peract_ndf.sh',TASK='open_drawer',NGPUS='2')
++        args=self.parse(command)
++        self.assertEqual(command[command.index('--nproc_per_node')+1],'2')
++        self.assertEqual(args['train_data_dir'],Path('zarr_datasets/peract_open_drawer/train.zarr'))
++        self.assertEqual(args['batch_size'],16)
++
++    def test_smoke_uses_same_arguments_with_separate_entrypoint(self):
++        args=self.command('train_peract_ndf.sh',SMOKE_ONLY='1')
++        self.assertEqual(args[args.index('--module')+1],'tools.smoke_train')
+--- /dev/null
++++ b/tools/__init__.py
+@@ -0,0 +1 @@
++"""NDF verification utilities; run with python -m tools.<name>."""
+--- /dev/null
++++ b/tools/check_data.py
+@@ -0,0 +1,39 @@
++"""Fail early on wrong task IDs, empty stores, camera layout or instructions."""
++import argparse
++import json
++from pathlib import Path
++import numpy as np
++import zarr
++from datasets.rlbench import PERACT_TASKS
++
++
++def main():
++    p=argparse.ArgumentParser(__doc__)
++    p.add_argument('--dataset-dir',required=True)
++    p.add_argument('--tasks',nargs='+',default=['push_buttons'],choices=PERACT_TASKS)
++    p.add_argument('--instructions',default='instructions/peract/instructions.json')
++    args=p.parse_args()
++    instructions=json.loads(Path(args.instructions).read_text())
++    expected={PERACT_TASKS.index(t) for t in args.tasks}
++    for split in ('train','val'):
++        group=zarr.open_group(str(Path(args.dataset_dir)/(split+'.zarr')),mode='r')
++        count=len(group['action'])
++        assert count>0, f'{split} has no samples'
++        assert all(len(group[k])==count for k in group.array_keys()), 'array lengths differ'
++        actual=set(map(int,np.unique(group['task_id'][:])))
++        assert actual==expected, f'{split} tasks {actual}; expected {expected}; use a new conversion directory'
++        assert group['rgb'].shape[1:]==(4,3,256,256)
++        assert group['pcd'].shape[1:]==(4,3,256,256)
++        assert group['action'].shape[1:]==(1,1,8)
++        assert group['proprioception'].shape[1:]==(3,1,8)
++        for tid,var in set(zip(group['task_id'][:].tolist(),group['variation'][:].tolist())):
++            assert instructions[PERACT_TASKS[tid]][str(var)], f'Missing instruction: {tid}, {var}'
++        # Sample integrity checks, not an expensive full geometry scan.
++        for i in np.linspace(0,count-1,min(16,count)).astype(int):
++            assert np.isfinite(group['pcd'][i]).all(), f'nonfinite pcd sample {i}'
++            assert np.isfinite(group['action'][i]).all(), f'nonfinite action sample {i}'
++        print(split, count, 'keypose samples;', args.tasks, '; canonical IDs', sorted(actual))
++
++
++if __name__=='__main__':
++    main()
+--- /dev/null
++++ b/tools/check_ndf.py
+@@ -0,0 +1,36 @@
++import argparse
++import json
++import torch
++from modeling.ndf.config import NDFConfig
++from modeling.ndf.fusion import FrozenNDFFusion
++
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument('--config', default='configs/ndf.json')
++    p.add_argument('--device', default='cuda')
++    args = p.parse_args()
++    torch.manual_seed(42)
++    model = FrozenNDFFusion(120, NDFConfig.read(args.config)).to(args.device).train()
++    cloud = torch.randn(512,3,device=args.device)*.08
++    queries = cloud[:32].unsqueeze(0)
++    z,c = model.encode_cloud(cloud)
++    before = model.describe(z,c,queries)
++    r,_ = torch.linalg.qr(torch.randn(3,3,device=args.device))
++    r[:,-1] *= torch.det(r)
++    t = torch.tensor([.2,-.1,.3],device=args.device)
++    z2,c2 = model.encode_cloud(cloud@r.T+t)
++    after = model.describe(z2,c2,queries@r.T+t)
++    torch.testing.assert_close(before,after,atol=3e-4,rtol=3e-3)
++    visual = torch.randn(1,32,120,device=args.device,requires_grad=True)
++    model.fusion(torch.cat((visual,before),-1)).square().mean().backward()
++    assert not model.field.training
++    assert all(not x.requires_grad and x.grad is None for x in model.field.parameters())
++    assert model.fusion.weight.grad[:,120:].abs().sum()>0
++    print(json.dumps({'descriptor_shape':list(before.shape), 'fusion_input_dim':model.fusion.in_features,
++                      'max_descriptor_error':(before-after).abs().max().item(),
++                      'frozen_field':True,'fusion_has_gradient':True},indent=2))
++
++
++if __name__=='__main__':
++    main()
+--- /dev/null
++++ b/tools/smoke_train.py
+@@ -0,0 +1,63 @@
++"""One actual baseline-config optimizer step; verify frozen NDF and inference.
++
++Use SMOKE_ONLY=1 bash scripts/rlbench/train_peract_ndf.sh. Writes no policy
++checkpoint; logs are isolated under the experiment's smoke directory.
++"""
++import os
++import torch
++import torch.distributed as dist
++from torch.nn.parallel import DistributedDataParallel
++from main import parse_arguments
++from datasets import fetch_dataset_class
++from modeling.policy import fetch_model_class
++from modeling.encoder.text import fetch_tokenizers
++from utils.trainers import fetch_train_tester
++from utils.schedulers import fetch_scheduler
++
++
++def main():
++    args=parse_arguments()
++    args.local_rank=int(os.environ['LOCAL_RANK'])
++    torch.cuda.set_device(args.local_rank)
++    dist.init_process_group('nccl')
++    try:
++        args.log_dir=args.base_log_dir/args.exp_log_dir/'smoke'
++        args.log_dir.mkdir(parents=True,exist_ok=True)
++        args.checkpoint=None  # this diagnostic never resumes/overwrites a training run
++        tester=fetch_train_tester(args.dataset)(args,fetch_dataset_class(args.dataset),fetch_model_class(args.model_type))
++        train,_,_=tester.get_loaders()
++        if not len(train):
++            raise ValueError('Not enough data for a full training batch')
++        model=tester.get_model().cuda()
++        model.workspace_normalizer.copy_(tester.get_workspace_normalizer().cuda())
++        tester.tokenizer=fetch_tokenizers(args.backbone)
++        ndf=model.encoder.ndf_fusion
++        if ndf is None:
++            raise ValueError('Run this diagnostic in MODE=ndf')
++        before={k:v.detach().cpu().clone() for k,v in ndf.field.state_dict().items()}
++        fusion_before=ndf.fusion.weight.detach().clone()
++        optimizer=tester.get_optimizer(model)
++        frozen_ids={id(p) for p in ndf.field.parameters()}
++        assert not any(id(p) in frozen_ids for g in optimizer.param_groups for p in g['params'])
++        model=DistributedDataParallel(model,device_ids=[args.local_rank],broadcast_buffers=False,find_unused_parameters=True)
++        model.train()
++        batch=next(iter(train))
++        scheduler=fetch_scheduler(args.lr_scheduler,optimizer,args.train_iters)
++        tester.train_one_step(model,optimizer,torch.GradScaler(),scheduler,batch)
++        assert all(p.grad is None for p in ndf.field.parameters())
++        assert all(torch.equal(v.detach().cpu(),before[k]) for k,v in ndf.field.state_dict().items())
++        assert torch.isfinite(ndf.fusion.weight).all()
++        assert not torch.equal(ndf.fusion.weight,fusion_before), 'Fusion weights did not update'
++        model.eval()
++        with torch.inference_mode():
++            action=tester._model_forward(model,batch,training=False)
++        assert action.shape[-2:]==(1,8) and torch.isfinite(action).all()
++        if dist.get_rank()==0:
++            print('PASS: real batch backward/optimizer/inference; frozen NDF unchanged; fusion updated.')
++            print('Action shape:',tuple(action.shape))
++    finally:
++        dist.destroy_process_group()
++
++
++if __name__=='__main__':
++    main()
+--- a/utils/trainers/base.py
++++ b/utils/trainers/base.py
+@@ -14,6 +14,7 @@
+ from tqdm import trange, tqdm
+ 
+ from modeling.encoder.text import fetch_tokenizers
++from modeling.ndf.config import NDFConfig, metadata, check_resume
+ from ..common_utils import count_parameters
+ from ..depth2cloud import fetch_depth2cloud
+ from ..data_preprocessors import fetch_data_preprocessor
+@@ -30,6 +31,14 @@
+         self.args = args
+         self.dataset_cls = dataset_cls
+         self.model_cls = model_cls
++        args.ndf_settings = NDFConfig.read(args.ndf_config).to_dict() if args.ndf_config else None
++        if args.ndf_settings and (args.model_type != 'denoise3d' or args.bimanual):
++            raise ValueError('NDF fusion currently targets single-arm denoise3d')
++        if args.ndf_settings and args.use_compile:
++            raise ValueError('NDF point filtering requires use_compile=false')
++        if dist.get_rank() == 0:
++            import json
++            (args.log_dir / 'run_config.json').write_text(json.dumps(vars(args), default=str, indent=2))
+ 
+         self.preprocessor = fetch_data_preprocessor(self.args.dataset)(
+             self.args.keypose_only,
+@@ -109,6 +118,10 @@
+     def get_model(self):
+         """Initialize the model."""
+         # Initialize model with arguments
++        ndf_kwargs = {}
++        if self.args.ndf_settings is not None:
++            ndf_kwargs = dict(ndf_config=self.args.ndf_settings,
++                              ndf_load_pretrained=not (self.args.checkpoint and os.path.isfile(self.args.checkpoint)))
+         _model = self.model_cls(
+             backbone=self.args.backbone,
+             finetune_backbone=self.args.finetune_backbone,
+@@ -124,7 +137,8 @@
+             rotation_format=self.args.rotation_format,
+             denoise_timesteps=self.args.denoise_timesteps,
+             denoise_model=self.args.denoise_model,
+-            lv2_batch_size=self.args.lv2_batch_size
++            lv2_batch_size=self.args.lv2_batch_size,
++            **ndf_kwargs
+         )
+ 
+         # Print basic modules' parameters
+@@ -229,7 +243,7 @@
+         # Get model
+         model = self.get_model()
+         self.tokenizer = fetch_tokenizers(self.args.backbone)
+-        if not os.path.exists(self.args.checkpoint):
++        if not self.args.checkpoint or not os.path.exists(self.args.checkpoint):
+             normalizer = self.get_workspace_normalizer()
+             model.workspace_normalizer.copy_(normalizer)
+             dist.barrier(device_ids=[torch.cuda.current_device()])
+@@ -423,7 +437,7 @@
+     def load_checkpoint(self, model, ema_model, optimizer):
+         """Load from checkpoint."""
+         print("=> trying checkpoint '{}'".format(self.args.checkpoint))
+-        if not os.path.exists(self.args.checkpoint):
++        if not self.args.checkpoint or not os.path.exists(self.args.checkpoint):
+             print('Warning: checkpoint was not found, starting from scratch')
+             print('The main process will compute workspace bounds')
+             return 0, None
+@@ -433,8 +447,9 @@
+             map_location="cpu",
+             weights_only=True
+         )
++        check_resume(model_dict, self.args)
+         # Load weights flexibly
+-        msn, unxpct = model.load_state_dict(model_dict["weight"], strict=False)
++        msn, unxpct = model.load_state_dict(model_dict["weight"], strict=self.args.ndf_settings is not None)
+         if msn:
+             print(f"Missing keys (not found in checkpoint): {len(msn)}")
+             print(msn)
+@@ -469,6 +484,7 @@
+         if best_loss is None or new_loss <= best_loss:
+             best_loss = new_loss
+             torch.save({
++                **metadata(self.args),
+                 "weight": model_state,
+                 "ema_weight": ema_state,
+                 "iter": step_id + 1,
+@@ -477,6 +493,7 @@
+ 
+         # Last checkpoint (always saved)
+         torch.save({
++            **metadata(self.args),
+             "weight": model_state,
+             "ema_weight": ema_state,
+             "optimizer": optimizer.state_dict(),
+@@ -487,6 +504,7 @@
+         # Save intermediate checkpoints
+         if (step_id + 1) % self.args.interm_ckpt_freq == 0:
+             torch.save({
++                **metadata(self.args),
+                 "weight": model_state,
+                 "ema_weight": ema_state,
+                 "iter": step_id + 1,

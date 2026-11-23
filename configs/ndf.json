@@ -1,0 +1,7 @@
+{
+  "checkpoint": "../checkpoints/multi_category_weights.pth",
+  "latent_dim": 256,
+  "num_points": 512,
+  "query_chunk_size": 256,
+  "scaling": 10.0
+}

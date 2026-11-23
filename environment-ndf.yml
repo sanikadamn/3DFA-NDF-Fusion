@@ -1,0 +1,8 @@
+name: 3dfa-ndf
+channels:
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - setuptools<81
+  - wheel

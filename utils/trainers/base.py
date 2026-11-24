@@ -11,6 +11,7 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.tensorboard import SummaryWriter
+from utils.wandb_logging import WandbLogger
 from tqdm import trange, tqdm
 
 from modeling.encoder.text import fetch_tokenizers
@@ -47,8 +48,16 @@ class BaseTrainTester:
             depth2cloud=fetch_depth2cloud(self.args.dataset)
         )
 
+        self.wandb_logger = WandbLogger(args, rank=dist.get_rank())
         if dist.get_rank() == 0 and not self.args.eval_only:
             self.writer = SummaryWriter(log_dir=args.log_dir)
+
+    def close_loggers(self, exit_code=0):
+        try:
+            if hasattr(self, "writer"):
+                self.writer.close()
+        finally:
+            self.wandb_logger.finish(exit_code=exit_code)
 
     def get_datasets(self):
         """Initialize datasets."""
@@ -426,6 +435,8 @@ class BaseTrainTester:
             if step_id > -1:
                 for key, val in values.items():
                     self.writer.add_scalar(key, val, step_id)
+                self.writer.flush()
+                self.wandb_logger.log(values, step_id)
 
             # Also log to terminal
             print(f"Step {step_id}:")

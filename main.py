@@ -118,10 +118,16 @@ if __name__ == '__main__':
 
     # Run
     TrainTester = fetch_train_tester(args.dataset)
-    train_tester = TrainTester(args, dataset_class, model_class)
-    train_tester.main()
-
-    # Safe program termination
-    if torch.distributed.is_initialized():
-        torch.cuda.empty_cache()
-        torch.distributed.destroy_process_group()
+    train_tester = None
+    try:
+        train_tester = TrainTester(args, dataset_class, model_class)
+        train_tester.main()
+    finally:
+        exit_code = 0 if sys.exc_info()[0] is None else 1
+        try:
+            if train_tester is not None:
+                train_tester.close_loggers(exit_code=exit_code)
+        finally:
+            if torch.distributed.is_initialized():
+                torch.cuda.empty_cache()
+                torch.distributed.destroy_process_group()

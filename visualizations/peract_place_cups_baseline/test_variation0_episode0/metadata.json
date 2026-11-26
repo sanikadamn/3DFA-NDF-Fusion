@@ -1,0 +1,11 @@
+{
+  "task": "place_cups",
+  "split": "test",
+  "variation": 0,
+  "episode": 0,
+  "checkpoint": "/home/ubuntu/3DFA-NDF-Fusion/train_logs/Peract_place_cups_baseline/denoise3d-PeractTwoCam-C120-B16-lr1e-4-constant-H3-rectified_flow/best.pth",
+  "actions": 20,
+  "frames": 261,
+  "success": false,
+  "error": null
+}

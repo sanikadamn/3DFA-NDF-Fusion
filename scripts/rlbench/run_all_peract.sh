@@ -19,7 +19,7 @@ tasks=(
     sweep_to_dustpan_of_size turn_tap
 )
 dataset=zarr_datasets/peract_all
-test_dir=$eDATA_DIR:-peract_raw/peract_test}
+test_dir=${DATA_DIR:-peract_raw/peract_test}
 run_name=denoise3d-PeractTwoCam-C120-B16-lr1e-4-constant-H3-rectified_flow
 mkdir -p peract_raw "$dataset" checkpoints logs/peract_all
 

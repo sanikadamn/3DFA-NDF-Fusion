@@ -1,3 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
 exp=${EXP_NAME:-peract}
 read -r -a tasks <<< "${TASKS:-push_buttons stack_cups}"
 
@@ -9,11 +13,11 @@ max_tries=2
 max_steps=20
 headless=true
 collision_checking=false
-seed=0
+seed=${SEED:-0}
 
 # Dataset arguments
 data_dir=${DATA_DIR:-peract_raw/test}
-dataset=Peract
+dataset=PeractTwoCam
 image_size=256,256
 
 # Model arguments

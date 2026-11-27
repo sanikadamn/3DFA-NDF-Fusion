@@ -189,6 +189,26 @@ You can download a trained checkpoint [here](https://huggingface.co/katefgroup/3
 
 ## Training
 
+### Full PerAct baseline + NDF pipeline (two-camera)
+
+After activating the installed 3DFA/NDF environment and setting up PerAct
+RLBench/PyRep, run:
+
+```bash
+export COPPELIASIM_ROOT=/path/to/CoppeliaSim_Edu_V4_1_0_Ubuntu20_04
+bash scripts/rlbench/run_all_peract.sh
+```
+
+This downloads the official demonstrations/test states, converts **all 18 tasks
+into one combined dataset**, and trains **two models total** (baseline and NDF),
+each for **300,000 iterations**, with wrist/front cameras. It then evaluates
+both models on every task using seeds 0–9 and 25 held-out episodes per seed.
+Results are saved under `eval_logs/Peract_all_{baseline,ndf}/best/seed*/`.
+The script retains downloaded archives and uses `zarr_datasets/peract_all` to
+avoid reusing an older subset dataset. The converter skips existing stores;
+inspect incomplete conversions before rerunning. Training resumes `last.pth`;
+evaluation reruns and overwrites the same result paths.
+
 All training commands below are run from the repository root. To train one
 model jointly on `push_buttons` and `stack_cups` for the default 300,000
 iterations:
@@ -233,6 +253,23 @@ Matplotlib, Xvfb, FFmpeg, and the PerAct RLBench/PyRep setup above.
 `DATASET_DIR` must contain `train.zarr` and `val.zarr`. Checkpoints are saved
 under `train_logs/$EXP_NAME/`. The tested PerAct launcher uses one GPU, batch
 size 16, one data-loader worker, and no `torch.compile`.
+
+For an NDF `place_cups` run, generate the same validation plot, held-out test
+results, and two test-rollout MP4/GIF pairs after training:
+
+```bash
+TASK=place_cups MODE=ndf bash scripts/rlbench/visualize_peract_ndf.sh
+```
+
+The script reads `best.pth` and TensorBoard events from the matching training
+run under `train_logs/Peract_place_cups_ndf/`. It writes the plot and videos to
+`visualizations/peract_place_cups_ndf/` and the simulator results to
+`eval_logs/Peract_place_cups_ndf/`. Set `EXP_NAME` if the training run used a
+different name; `RUN_DIR`, `VIS_DIR`, and `TEST_DIR` can override the paths.
+The default visualization task and mode are `place_cups` and `ndf`.
+If this checkout links its `zarr_datasets` directory to another checkout, the
+script also looks there for the held-out test episodes and CoppeliaSim. You can
+set `TEST_DIR` or `COPPELIASIM_ROOT` explicitly when they live elsewhere.
 
 The other benchmark launchers are:
 

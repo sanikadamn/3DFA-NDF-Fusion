@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
-task=${TASK:-push_buttons}
-mode=${MODE:-ndf}
+task=${TASK:-stack_cups}
+mode=${MODE:-baseline}
 case "$mode" in ndf|baseline) ;; *) echo 'MODE must be ndf or baseline' >&2; exit 2;; esac
 ndf_args=()
 if [[ "$mode" == ndf ]]; then ndf_args=(--ndf_config "${NDF_CONFIG:-configs/ndf.json}"); fi
